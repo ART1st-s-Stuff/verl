@@ -21,6 +21,7 @@ import logging
 import os
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -39,6 +40,8 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+from verl.workers.roles.utils.mcts_planner import MCTSPlanner, MCTSPlannerConfig
+from verl.workers.roles.utils.world_model import LatentStateEncoder, TransitionRewardNet
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -91,13 +94,47 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+        self.state_encoder = None
+        self.transition_reward_net = None
+        self.world_model_optimizer = None
+        self.mcts_planner = None
+        if self.actor_optimizer is not None and self.config.num_actions > 0 and self.config.world_state_dim > 0:
+            model_cfg = getattr(getattr(self.actor_module, "module", self.actor_module), "config", None)
+            hidden_size = getattr(model_cfg, "hidden_size", None)
+            if hidden_size is None:
+                raise ValueError("Actor model config must define hidden_size when world model is enabled.")
+            transition_hidden_dim = self.config.transition_hidden_dim or hidden_size
+            self.state_encoder = LatentStateEncoder(hidden_size, self.config.world_state_dim).to(get_device_id())
+            self.transition_reward_net = TransitionRewardNet(
+                world_state_dim=self.config.world_state_dim,
+                num_actions=self.config.num_actions,
+                hidden_dim=transition_hidden_dim,
+            ).to(get_device_id())
+            world_model_lr = self.config.action_head_lr or self.config.optim.lr
+            self.world_model_optimizer = torch.optim.AdamW(
+                list(self.state_encoder.parameters()) + list(self.transition_reward_net.parameters()),
+                lr=world_model_lr,
+            )
+            self.mcts_planner = MCTSPlanner(
+                transition_model=self.transition_reward_net,
+                num_actions=self.config.num_actions,
+                config=MCTSPlannerConfig(
+                    depth=self.config.mcts.depth,
+                    branching=self.config.mcts.branching,
+                    c_puct=self.config.mcts.c_puct,
+                    rollout_steps=self.config.mcts.rollout_steps,
+                    discount=self.config.mcts.discount,
+                ),
+            )
+
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, micro_batch, temperature, calculate_entropy=False, extract_latent=False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            latent_last: # (bs, hidden_size), optional
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -112,6 +149,7 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            latent_last = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -252,6 +290,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                if extract_latent:
+                    extra_args["output_hidden_states"] = True
 
                 output = self.actor_module(
                     input_ids=input_ids,
@@ -278,7 +318,15 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+                if extract_latent:
+                    hidden_states = getattr(output, "hidden_states", None)
+                    if hidden_states is not None and len(hidden_states) > 0:
+                        seq_hidden = hidden_states[-1]
+                        last_indices = attention_mask.long().sum(dim=1) - 1
+                        batch_indices = torch.arange(seq_hidden.shape[0], device=seq_hidden.device)
+                        latent_last = seq_hidden[batch_indices, last_indices]
+
+            return entropy, log_probs, latent_last
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -307,7 +355,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -331,6 +379,8 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        extract_latent = data.meta_info.get("extract_latent", False)
+        enable_gradient_for_latent = data.meta_info.get("enable_gradient_for_latent", False)
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -345,28 +395,40 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        latent_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+            grad_ctx = torch.enable_grad() if enable_gradient_for_latent else torch.no_grad()
+            with grad_ctx:
+                entropy, log_probs, latent = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    extract_latent=extract_latent,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if extract_latent and latent is not None:
+                latent_lst.append(latent)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        latent = None
+        if extract_latent and len(latent_lst) > 0:
+            latent = torch.concat(latent_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if latent is not None:
+                latent = restore_dynamic_batch(latent, batch_idx_list)
 
-        return log_probs, entropys
+        return log_probs, entropys, latent
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -418,6 +480,8 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                if self.world_model_optimizer is not None:
+                    self.world_model_optimizer.zero_grad(set_to_none=True)
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -439,8 +503,11 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    entropy, log_prob, latent = self._forward_micro_batch(
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                        extract_latent=self.state_encoder is not None,
                     )
 
                     # for fully_async_policy recipe
@@ -509,6 +576,32 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
+                    if (
+                        self.state_encoder is not None
+                        and self.transition_reward_net is not None
+                        and latent is not None
+                        and "action_labels" in model_inputs
+                        and "step_rewards" in model_inputs
+                    ):
+                        latent_input = latent.detach() if self.config.action_head_detach_latent else latent
+                        world_state = self.state_encoder(latent_input)
+                        action_labels = model_inputs["action_labels"].long()
+                        pred_next_state, pred_reward = self.transition_reward_net(world_state, action_labels)
+                        reward_target = model_inputs["step_rewards"].float().reshape_as(pred_reward)
+                        reward_loss = F.mse_loss(pred_reward, reward_target)
+                        policy_loss = policy_loss + self.config.reward_loss_coef * reward_loss
+                        micro_batch_metrics["actor/reward_loss"] = reward_loss.detach().item() * loss_scale_factor
+
+                        if "next_latent" in model_inputs:
+                            next_latent = model_inputs["next_latent"]
+                            if next_latent.dim() == 3:
+                                next_latent = next_latent[:, -1, :]
+                            with torch.no_grad():
+                                target_next_state = self.state_encoder(next_latent)
+                            state_loss = F.mse_loss(pred_next_state, target_next_state)
+                            policy_loss = policy_loss + self.config.state_loss_coef * state_loss
+                            micro_batch_metrics["actor/state_loss"] = state_loss.detach().item() * loss_scale_factor
+
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * loss_scale_factor
@@ -523,7 +616,11 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
+                if self.world_model_optimizer is not None:
+                    self.world_model_optimizer.step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        if self.world_model_optimizer is not None:
+            self.world_model_optimizer.zero_grad(set_to_none=True)
         return metrics

@@ -94,6 +94,16 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+ACTION_TOKENS = [
+    "<|act_moveahead|>",
+    "<|act_moveback|>",
+    "<|act_moveright|>",
+    "<|act_moveleft|>",
+    "<|act_rotateright|>",
+    "<|act_rotateleft|>",
+    "<|act_lookup|>",
+    "<|act_lookdown|>",
+]
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -972,16 +982,36 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["extract_latent"] = self.actor.state_encoder is not None
+        data.meta_info["enable_gradient_for_latent"] = (
+            self.actor.state_encoder is not None and not self.config.actor.action_head_detach_latent
+        )
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys, latent = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            output_tensors = {"old_log_probs": output, "entropys": entropys}
+            output_non_tensors = {}
+            if latent is not None:
+                output_tensors["latent"] = latent
+                if self.actor.state_encoder is not None:
+                    latent_input = latent.detach() if self.config.actor.action_head_detach_latent else latent
+                    world_state = self.actor.state_encoder(latent_input)
+                    output_tensors["world_state"] = world_state
+                    if self.config.actor.enable_latent_mcts and self.actor.mcts_planner is not None:
+                        action_ids = self.actor.mcts_planner.plan(world_state)
+                        output_tensors["planned_action_ids"] = action_ids
+                        if self.config.actor.num_actions <= len(ACTION_TOKENS):
+                            output_non_tensors["planned_action_tokens"] = [
+                                ACTION_TOKENS[int(x)] for x in action_ids.tolist()
+                            ]
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=output_tensors,
+                non_tensors=output_non_tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
-
-        output = output.to("cpu")
+        if not data.meta_info["enable_gradient_for_latent"]:
+            output = output.to("cpu")
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
@@ -1015,7 +1045,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
 
         output = output.to("cpu")

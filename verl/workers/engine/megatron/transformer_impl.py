@@ -39,6 +39,7 @@ from verl.utils.megatron_utils import (
     offload_megatron_optimizer,
     per_tensor_generator,
     register_megatron_training_hooks,
+    unwrap_model,
 )
 from verl.utils.model import load_mcore_dist_weights, load_megatron_gptmodel_weights
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
@@ -559,12 +560,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
     def prepare_model_outputs(self, output: dict, data: TensorDict):
         calculate_entropy = tu.get_non_tensor_data(data, key="calculate_entropy", default=False)
+        extract_latent = tu.get_non_tensor_data(data, key="extract_latent", default=False)
 
         log_prob = output["log_probs"]
         model_output = {"log_probs": log_prob}
         if calculate_entropy:
             entropy = output["entropy"]
             model_output["entropy"] = entropy
+        if extract_latent and "latent" in output:
+            model_output["latent"] = output["latent"]
 
         return model_output
 
@@ -573,6 +577,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         batch = batch.to(get_device_id())
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
+        extract_latent = tu.get_non_tensor_data(batch, key="extract_latent", default=False)
         pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         temperature = batch["temperature"]
 
@@ -591,6 +596,19 @@ class MegatronEngineWithLMHead(MegatronEngine):
             raise NotImplementedError("Fused kernels are not supported for megatron engine")
 
         forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
+        pre_logits_latent = {}
+
+        def _get_output_layer(m):
+            m = unwrap_model(m)
+            if hasattr(m, "output_layer"):
+                return m.output_layer
+            if hasattr(m, "language_model") and hasattr(m.language_model, "output_layer"):
+                return m.language_model.output_layer
+            return None
+
+        def _capture_pre_logits(_module, hook_inputs):
+            if len(hook_inputs) > 0 and isinstance(hook_inputs[0], torch.Tensor):
+                pre_logits_latent["latent"] = hook_inputs[0]
 
         def logits_processor(logits, label):
             assert logits.shape[:2] == label.shape[:2]
@@ -620,17 +638,28 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
             log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
             ret["log_probs"] = log_probs
+            if extract_latent and "latent" in pre_logits_latent:
+                ret["latent"] = pre_logits_latent["latent"]
             return ret
 
         logits_processor_args = {"label": label}
+        hook_handle = None
+        if extract_latent:
+            output_layer = _get_output_layer(model)
+            if output_layer is not None:
+                hook_handle = output_layer.register_forward_pre_hook(_capture_pre_logits)
 
-        output = forward_fn(
-            model,
-            input_ids,
-            multi_modal_inputs,
-            logits_processor=logits_processor,
-            logits_processor_args=logits_processor_args,
-        )
+        try:
+            output = forward_fn(
+                model,
+                input_ids,
+                multi_modal_inputs,
+                logits_processor=logits_processor,
+                logits_processor_args=logits_processor_args,
+            )
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
 
         return output, partial(postprocess_micro_batch_func, data=batch)
 

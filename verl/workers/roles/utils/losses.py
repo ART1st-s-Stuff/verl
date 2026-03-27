@@ -14,6 +14,7 @@
 
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
@@ -53,7 +54,7 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {"loss": loss.detach().item()}
 
 
-def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None, action_head=None):
     log_prob = model_output["log_probs"]
     entropy = model_output.get("entropy", None)
 
@@ -101,6 +102,18 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = kl_loss.detach().item()
         metrics["kl_coef"] = config.kl_loss_coef
+
+    # optional latent action head loss
+    if action_head is not None and "action_labels" in data and "latent" in model_output:
+        latent = model_output["latent"]
+        latent_last = latent.values()[latent.offsets()[1:] - 1]
+        if config.action_head_detach_latent:
+            latent_last = latent_last.detach()
+        action_scores = action_head(latent_last)
+        action_labels = data["action_labels"].long()
+        action_loss = F.cross_entropy(action_scores, action_labels)
+        policy_loss = policy_loss + config.action_head_loss_coef * action_loss
+        metrics["actor/action_loss"] = action_loss.detach().item()
 
     return policy_loss, metrics
 

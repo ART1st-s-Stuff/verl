@@ -115,6 +115,11 @@ class ActorConfig(BaseConfig):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
+    num_actions: int = 0
+    action_head_hidden_size: Optional[int] = None
+    action_head_loss_coef: float = 1.0
+    action_head_detach_latent: bool = False
+    action_head_lr: Optional[float] = None
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
     data_loader_seed = 1

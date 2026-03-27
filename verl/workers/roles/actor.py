@@ -17,6 +17,8 @@ import os
 from functools import partial
 
 import psutil
+import torch
+import torch.nn as nn
 from codetiming import Timer
 
 from verl import DataProto
@@ -39,6 +41,19 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+class LatentActionHead(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_size),
+        )
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.net(latent)
 
 
 class ActorWorker(Worker, DistProfilerExtension):
@@ -94,6 +109,18 @@ class ActorWorker(Worker, DistProfilerExtension):
         # setup flops counter
         self.flops_counter = FlopsCounter(self.model_config.hf_config)
 
+        self.action_head = None
+        self.action_head_optimizer = None
+        if self.config.num_actions > 0:
+            hidden_size = self.model_config.hf_config.hidden_size
+            action_head_hidden_size = self.config.action_head_hidden_size or hidden_size
+            self.action_head = LatentActionHead(hidden_size, action_head_hidden_size, self.config.num_actions).to(
+                get_device_id()
+            )
+            action_head_lr = self.config.action_head_lr or self.optimizer_config.lr
+            self.action_head_optimizer = torch.optim.AdamW(self.action_head.parameters(), lr=action_head_lr)
+            self.loss_fn = partial(ppo_loss, config=self.config, action_head=self.action_head)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         self._build_engine()
@@ -117,6 +144,8 @@ class ActorWorker(Worker, DistProfilerExtension):
             data.meta_info["micro_batch_size_per_gpu"] = self.config.ppo_infer_micro_batch_size_per_gpu
 
         with self.engine.eval_mode():
+            if self.action_head is not None:
+                self.action_head.eval()
             # TODO: make worker API to accept TensorDict as well
             data = data.to_tensordict()
             data = left_right_2_no_padding(data)
@@ -141,7 +170,11 @@ class ActorWorker(Worker, DistProfilerExtension):
             if extract_latent and "latent" in output:
                 # Keep only the last token latent for each sample.
                 latent = output["latent"]
-                output_tensors["latent"] = latent.values()[latent.offsets()[1:] - 1]
+                latent = latent.values()[latent.offsets()[1:] - 1]
+                output_tensors["latent"] = latent
+                if self.action_head is not None:
+                    latent_input = latent.detach() if self.config.action_head_detach_latent else latent
+                    output_tensors["action_scores"] = self.action_head(latent_input)
             output = DataProto.from_dict(
                 tensors=output_tensors,
             )
@@ -155,6 +188,8 @@ class ActorWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         data.meta_info["use_fused_kernels"] = self.config.use_fused_kernels
         data.meta_info["calculate_entropy"] = self.config.entropy_coeff != 0.0
+        data.meta_info["extract_latent"] = self.action_head is not None
+        data.meta_info["enable_gradient_for_latent"] = self.action_head is not None and not self.config.action_head_detach_latent
         if self.config.use_dynamic_bsz:
             data.meta_info["max_token_len_per_gpu"] = self.config.ppo_max_token_len_per_gpu
         else:
@@ -165,6 +200,8 @@ class ActorWorker(Worker, DistProfilerExtension):
         data = data.to(get_device_id())
         # perform forward computation
         with self.engine.train_mode():
+            if self.action_head is not None:
+                self.action_head.train()
             dataloader = data.make_iterator(
                 mini_batch_size=self.ppo_mini_batch_size_per_dp,
                 epochs=self.config.ppo_epochs,
@@ -177,7 +214,11 @@ class ActorWorker(Worker, DistProfilerExtension):
                     # TODO: make worker API to accept TensorDict as well
                     mini_batch = mini_batch.to_tensordict()
                     mini_batch = left_right_2_no_padding(mini_batch)
+                    if self.action_head_optimizer is not None:
+                        self.action_head_optimizer.zero_grad(set_to_none=True)
                     output = self.engine.train_batch(mini_batch, self.loss_fn)
+                    if self.action_head_optimizer is not None:
+                        self.action_head_optimizer.step()
                     mini_batch_metrics = output.get("metrics", {})
                     append_to_dict(metrics, mini_batch_metrics, prefix="actor/")
 

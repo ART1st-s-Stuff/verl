@@ -106,6 +106,8 @@ class ActorWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
+        extract_latent = data.meta_info.get("extract_latent", False)
+        enable_gradient_for_latent = data.meta_info.get("enable_gradient_for_latent", False)
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         data.meta_info["use_fused_kernels"] = self.config.use_fused_kernels
         data.meta_info["calculate_entropy"] = True
@@ -118,7 +120,12 @@ class ActorWorker(Worker, DistProfilerExtension):
             # TODO: make worker API to accept TensorDict as well
             data = data.to_tensordict()
             data = left_right_2_no_padding(data)
-            output = self.engine.infer_batch(data)
+            if enable_gradient_for_latent:
+                # infer_batch wraps the forward pass with torch.no_grad().
+                # Use forward_backward_batch(forward_only=True) to preserve autograd graph.
+                output = self.engine.forward_backward_batch(data, loss_function=None, forward_only=True)
+            else:
+                output = self.engine.infer_batch(data)
 
         if self.engine.is_mp_src_rank_with_outputs():
             output = output["model_output"]
@@ -130,10 +137,16 @@ class ActorWorker(Worker, DistProfilerExtension):
                 entropy = no_padding_2_padding(entropy, data)  # (bsz, response_length)
 
             # in megatron, only last pp contains valid data and returned to the single controller
+            output_tensors = {"old_log_probs": log_probs.float(), "entropy": entropy.float()}
+            if extract_latent and "latent" in output:
+                # Keep only the last token latent for each sample.
+                latent = output["latent"]
+                output_tensors["latent"] = latent.values()[latent.offsets()[1:] - 1]
             output = DataProto.from_dict(
-                tensors={"old_log_probs": log_probs.float(), "entropy": entropy.float()},
+                tensors=output_tensors,
             )
-            output = output.to("cpu")
+            if not enable_gradient_for_latent:
+                output = output.to("cpu")
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

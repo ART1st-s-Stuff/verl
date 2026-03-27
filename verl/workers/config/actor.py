@@ -25,7 +25,7 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["PolicyLossConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = ["PolicyLossConfig", "MCTSConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
 
 
 @dataclass
@@ -49,6 +49,15 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+
+
+@dataclass
+class MCTSConfig(BaseConfig):
+    depth: int = 3
+    branching: int = 8
+    c_puct: float = 1.0
+    rollout_steps: int = 1
+    discount: float = 0.99
 
 
 @dataclass
@@ -116,10 +125,14 @@ class ActorConfig(BaseConfig):
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
     num_actions: int = 0
-    action_head_hidden_size: Optional[int] = None
-    action_head_loss_coef: float = 1.0
+    world_state_dim: int = 0
+    transition_hidden_dim: Optional[int] = None
+    state_loss_coef: float = 1.0
+    reward_loss_coef: float = 1.0
     action_head_detach_latent: bool = False
     action_head_lr: Optional[float] = None
+    enable_latent_mcts: bool = False
+    mcts: MCTSConfig = field(default_factory=MCTSConfig)
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
     data_loader_seed = 1

@@ -18,7 +18,6 @@ from functools import partial
 
 import psutil
 import torch
-import torch.nn as nn
 from codetiming import Timer
 
 from verl import DataProto
@@ -35,25 +34,24 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension
 from verl.utils.py_functional import append_to_dict
 from verl.workers.config import ActorConfig
 from verl.workers.roles.utils.losses import ppo_loss
+from verl.workers.roles.utils.mcts_planner import MCTSPlanner, MCTSPlannerConfig
 from verl.workers.roles.utils.padding import left_right_2_no_padding, no_padding_2_padding
+from verl.workers.roles.utils.world_model import LatentStateEncoder, TransitionRewardNet
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
-
-
-class LatentActionHead(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, output_size: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, output_size),
-        )
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.net(latent)
+ACTION_TOKENS = [
+    "<|act_moveahead|>",
+    "<|act_moveback|>",
+    "<|act_moveright|>",
+    "<|act_moveleft|>",
+    "<|act_rotateright|>",
+    "<|act_rotateleft|>",
+    "<|act_lookup|>",
+    "<|act_lookdown|>",
+]
 
 
 class ActorWorker(Worker, DistProfilerExtension):
@@ -109,17 +107,41 @@ class ActorWorker(Worker, DistProfilerExtension):
         # setup flops counter
         self.flops_counter = FlopsCounter(self.model_config.hf_config)
 
-        self.action_head = None
-        self.action_head_optimizer = None
-        if self.config.num_actions > 0:
+        self.state_encoder = None
+        self.transition_reward_net = None
+        self.world_model_optimizer = None
+        self.mcts_planner = None
+        if self.config.num_actions > 0 and self.config.world_state_dim > 0:
             hidden_size = self.model_config.hf_config.hidden_size
-            action_head_hidden_size = self.config.action_head_hidden_size or hidden_size
-            self.action_head = LatentActionHead(hidden_size, action_head_hidden_size, self.config.num_actions).to(
-                get_device_id()
+            transition_hidden_dim = self.config.transition_hidden_dim or hidden_size
+            self.state_encoder = LatentStateEncoder(hidden_size, self.config.world_state_dim).to(get_device_id())
+            self.transition_reward_net = TransitionRewardNet(
+                world_state_dim=self.config.world_state_dim,
+                num_actions=self.config.num_actions,
+                hidden_dim=transition_hidden_dim,
+            ).to(get_device_id())
+            world_model_lr = self.config.action_head_lr or self.optimizer_config.lr
+            self.world_model_optimizer = torch.optim.AdamW(
+                list(self.state_encoder.parameters()) + list(self.transition_reward_net.parameters()),
+                lr=world_model_lr,
             )
-            action_head_lr = self.config.action_head_lr or self.optimizer_config.lr
-            self.action_head_optimizer = torch.optim.AdamW(self.action_head.parameters(), lr=action_head_lr)
-            self.loss_fn = partial(ppo_loss, config=self.config, action_head=self.action_head)
+            self.loss_fn = partial(
+                ppo_loss,
+                config=self.config,
+                state_encoder=self.state_encoder,
+                transition_reward_net=self.transition_reward_net,
+            )
+            self.mcts_planner = MCTSPlanner(
+                transition_model=self.transition_reward_net,
+                num_actions=self.config.num_actions,
+                config=MCTSPlannerConfig(
+                    depth=self.config.mcts.depth,
+                    branching=self.config.mcts.branching,
+                    c_puct=self.config.mcts.c_puct,
+                    rollout_steps=self.config.mcts.rollout_steps,
+                    discount=self.config.mcts.discount,
+                ),
+            )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -144,8 +166,10 @@ class ActorWorker(Worker, DistProfilerExtension):
             data.meta_info["micro_batch_size_per_gpu"] = self.config.ppo_infer_micro_batch_size_per_gpu
 
         with self.engine.eval_mode():
-            if self.action_head is not None:
-                self.action_head.eval()
+            if self.state_encoder is not None:
+                self.state_encoder.eval()
+            if self.transition_reward_net is not None:
+                self.transition_reward_net.eval()
             # TODO: make worker API to accept TensorDict as well
             data = data.to_tensordict()
             data = left_right_2_no_padding(data)
@@ -167,16 +191,26 @@ class ActorWorker(Worker, DistProfilerExtension):
 
             # in megatron, only last pp contains valid data and returned to the single controller
             output_tensors = {"old_log_probs": log_probs.float(), "entropy": entropy.float()}
+            output_non_tensors = {}
             if extract_latent and "latent" in output:
                 # Keep only the last token latent for each sample.
                 latent = output["latent"]
                 latent = latent.values()[latent.offsets()[1:] - 1]
                 output_tensors["latent"] = latent
-                if self.action_head is not None:
+                if self.state_encoder is not None:
                     latent_input = latent.detach() if self.config.action_head_detach_latent else latent
-                    output_tensors["action_scores"] = self.action_head(latent_input)
+                    world_state = self.state_encoder(latent_input)
+                    output_tensors["world_state"] = world_state
+                    if self.config.enable_latent_mcts and self.mcts_planner is not None:
+                        action_ids = self.mcts_planner.plan(world_state)
+                        output_tensors["planned_action_ids"] = action_ids
+                        if self.config.num_actions <= len(ACTION_TOKENS):
+                            output_non_tensors["planned_action_tokens"] = [
+                                ACTION_TOKENS[int(x)] for x in action_ids.tolist()
+                            ]
             output = DataProto.from_dict(
                 tensors=output_tensors,
+                non_tensors=output_non_tensors,
             )
             if not enable_gradient_for_latent:
                 output = output.to("cpu")
@@ -188,8 +222,8 @@ class ActorWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         data.meta_info["use_fused_kernels"] = self.config.use_fused_kernels
         data.meta_info["calculate_entropy"] = self.config.entropy_coeff != 0.0
-        data.meta_info["extract_latent"] = self.action_head is not None
-        data.meta_info["enable_gradient_for_latent"] = self.action_head is not None and not self.config.action_head_detach_latent
+        data.meta_info["extract_latent"] = self.state_encoder is not None
+        data.meta_info["enable_gradient_for_latent"] = self.state_encoder is not None and not self.config.action_head_detach_latent
         if self.config.use_dynamic_bsz:
             data.meta_info["max_token_len_per_gpu"] = self.config.ppo_max_token_len_per_gpu
         else:
@@ -200,8 +234,10 @@ class ActorWorker(Worker, DistProfilerExtension):
         data = data.to(get_device_id())
         # perform forward computation
         with self.engine.train_mode():
-            if self.action_head is not None:
-                self.action_head.train()
+            if self.state_encoder is not None:
+                self.state_encoder.train()
+            if self.transition_reward_net is not None:
+                self.transition_reward_net.train()
             dataloader = data.make_iterator(
                 mini_batch_size=self.ppo_mini_batch_size_per_dp,
                 epochs=self.config.ppo_epochs,
@@ -214,11 +250,11 @@ class ActorWorker(Worker, DistProfilerExtension):
                     # TODO: make worker API to accept TensorDict as well
                     mini_batch = mini_batch.to_tensordict()
                     mini_batch = left_right_2_no_padding(mini_batch)
-                    if self.action_head_optimizer is not None:
-                        self.action_head_optimizer.zero_grad(set_to_none=True)
+                    if self.world_model_optimizer is not None:
+                        self.world_model_optimizer.zero_grad(set_to_none=True)
                     output = self.engine.train_batch(mini_batch, self.loss_fn)
-                    if self.action_head_optimizer is not None:
-                        self.action_head_optimizer.step()
+                    if self.world_model_optimizer is not None:
+                        self.world_model_optimizer.step()
                     mini_batch_metrics = output.get("metrics", {})
                     append_to_dict(metrics, mini_batch_metrics, prefix="actor/")
 

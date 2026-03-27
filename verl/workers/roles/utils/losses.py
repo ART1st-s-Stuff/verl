@@ -54,7 +54,7 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {"loss": loss.detach().item()}
 
 
-def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None, action_head=None):
+def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None, state_encoder=None, transition_reward_net=None):
     log_prob = model_output["log_probs"]
     entropy = model_output.get("entropy", None)
 
@@ -103,17 +103,37 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         metrics["kl_loss"] = kl_loss.detach().item()
         metrics["kl_coef"] = config.kl_loss_coef
 
-    # optional latent action head loss
-    if action_head is not None and "action_labels" in data and "latent" in model_output:
+    # optional latent world-model loss branch
+    if (
+        state_encoder is not None
+        and transition_reward_net is not None
+        and "action_labels" in data
+        and "step_rewards" in data
+        and "latent" in model_output
+    ):
         latent = model_output["latent"]
         latent_last = latent.values()[latent.offsets()[1:] - 1]
         if config.action_head_detach_latent:
             latent_last = latent_last.detach()
-        action_scores = action_head(latent_last)
+        world_state = state_encoder(latent_last)
+
         action_labels = data["action_labels"].long()
-        action_loss = F.cross_entropy(action_scores, action_labels)
-        policy_loss = policy_loss + config.action_head_loss_coef * action_loss
-        metrics["actor/action_loss"] = action_loss.detach().item()
+        pred_next_state, pred_reward = transition_reward_net(world_state, action_labels)
+
+        reward_target = data["step_rewards"].float().reshape_as(pred_reward)
+        reward_loss = F.mse_loss(pred_reward, reward_target)
+        policy_loss = policy_loss + config.reward_loss_coef * reward_loss
+        metrics["actor/reward_loss"] = reward_loss.detach().item()
+
+        if "next_latent" in data:
+            next_latent = data["next_latent"]
+            if next_latent.dim() == 3:
+                next_latent = next_latent[:, -1, :]
+            with torch.no_grad():
+                target_next_state = state_encoder(next_latent)
+            state_loss = F.mse_loss(pred_next_state, target_next_state)
+            policy_loss = policy_loss + config.state_loss_coef * state_loss
+            metrics["actor/state_loss"] = state_loss.detach().item()
 
     return policy_loss, metrics
 

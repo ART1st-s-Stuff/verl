@@ -74,6 +74,7 @@ from verl.utils.fsdp_utils import (
     layered_summon_lora_params,
     load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
+    materialize_state_dict_tensors_for_weight_sync,
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
     replace_lora_wrapper,
@@ -684,6 +685,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         )
+        params = materialize_state_dict_tensors_for_weight_sync(params)
 
         # Special handling for LoRA with sleep_level=2:
         # When sleep_level=2, base model weights are destroyed during each sleep cycle.
@@ -699,6 +701,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             base_model_params = convert_weight_keys(
                 base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
             )
+            base_model_params = materialize_state_dict_tensors_for_weight_sync(base_model_params)
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._is_offload_param:
@@ -712,7 +715,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
             per_tensor_param = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                (
+                    name,
+                    (
+                        param.to(device, non_blocking=False).full_tensor().contiguous()
+                        if isinstance(param, DTensor)
+                        else param.to(device, non_blocking=False).contiguous()
+                    ),
+                )
                 for name, param in params.items()
             )
 
@@ -722,7 +732,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
             per_tensor_base_params = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                (
+                    name,
+                    (
+                        param.to(device, non_blocking=False).full_tensor().contiguous()
+                        if isinstance(param, DTensor)
+                        else param.to(device, non_blocking=False).contiguous()
+                    ),
+                )
                 for name, param in base_model_params.items()
             )
             await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)

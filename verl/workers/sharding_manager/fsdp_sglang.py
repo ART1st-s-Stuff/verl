@@ -27,7 +27,12 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataP
 from verl import DataProto
 from verl.protocol import all_gather_data_proto
 from verl.utils.device import get_device_id, get_torch_device, set_expandable_segments
-from verl.utils.fsdp_utils import fsdp_version, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
+from verl.utils.fsdp_utils import (
+    fsdp_version,
+    load_fsdp_model_to_gpu,
+    materialize_state_dict_tensors_for_weight_sync,
+    offload_fsdp_model_to_cpu,
+)
 from verl.utils.import_utils import deprecated
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import convert_weight_keys
@@ -136,11 +141,12 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
         params = {
-            k: v.to(device, non_blocking=True) if fsdp_version(self.module) == 2 else v for k, v in params.items()
+            k: v.to(device, non_blocking=False) if fsdp_version(self.module) == 2 else v for k, v in params.items()
         }
 
         # convert weight keys to match the model config
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        params = materialize_state_dict_tensors_for_weight_sync(params)
 
         if self.offload_param:
             offload_fsdp_model_to_cpu(self.module)

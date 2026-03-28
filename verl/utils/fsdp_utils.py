@@ -200,6 +200,41 @@ def load_fsdp2_model_to_gpu(model):
     model.to(device)
 
 
+@functools.lru_cache(maxsize=1)
+def _get_dtensor_cls():
+    try:
+        from torch.distributed.tensor import DTensor
+
+        return DTensor
+    except ImportError:
+        pass
+    try:
+        from torch.distributed._tensor import DTensor
+
+        return DTensor
+    except ImportError:
+        return None
+
+
+@torch.no_grad()
+def materialize_state_dict_tensors_for_weight_sync(state_dict: dict) -> dict:
+    """Detach and clone tensors so they stay valid after FSDP CPU offload.
+
+    ``state_dict()`` values may alias FSDP ``flat_param`` storage. Calling
+    ``offload_fsdp_model_to_cpu`` afterwards can invalidate those tensors and
+    break CUDA IPC during multiprocessing pickling (e.g. SGLang ``update_weights``).
+    """
+    dt_cls = _get_dtensor_cls()
+    out = {}
+    for k, v in state_dict.items():
+        if isinstance(v, torch.Tensor):
+            t = v.full_tensor() if dt_cls is not None and isinstance(v, dt_cls) else v
+            out[k] = t.detach().clone().contiguous()
+        else:
+            out[k] = v
+    return out
+
+
 @torch.no_grad()
 def offload_fsdp_optimizer(optimizer):
     if not optimizer.state:

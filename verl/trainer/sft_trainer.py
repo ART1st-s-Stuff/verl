@@ -34,11 +34,13 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint import CheckpointHandler
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+from verl.utils.dataset.sft_dataset import SFTDataset
 from verl.utils.device import get_device_name, is_cuda_available, is_npu_available
 from verl.utils.distributed import destroy_global_process_group
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.logger import log_with_rank
 from verl.utils.tracking import Tracking
+from verl.workers.roles.utils.latent_supervision import FeatureEncoderHead
 
 if is_cuda_available:
     pass
@@ -76,7 +78,36 @@ class SFTTrainer:
 
         from verl.workers.roles.utils.losses import sft_loss
 
-        self.loss_fn = partial(sft_loss, config=None)
+        self.latent_sft_cfg = self.config.data.get("latent_sft", {})
+        self.latent_sft_enable = bool(self.latent_sft_cfg.get("enable", False))
+        self.clip_head = None
+        self.mae_head = None
+        self.latent_head_optimizer = None
+        if self.latent_sft_enable:
+            hidden_size = self.model_config.hf_config.hidden_size
+            clip_dim = int(self.latent_sft_cfg.get("clip_feature_dim", 512))
+            mae_dim = int(self.latent_sft_cfg.get("mae_feature_dim", 768))
+            head_hidden_dim = self.latent_sft_cfg.get("head_hidden_dim", None)
+            self.clip_head = FeatureEncoderHead(hidden_size, clip_dim, head_hidden_dim).to(self.config.trainer.device)
+            self.mae_head = FeatureEncoderHead(hidden_size, mae_dim, head_hidden_dim).to(self.config.trainer.device)
+            head_lr = float(self.latent_sft_cfg.get("head_lr", self.config.optim.lr))
+            self.latent_head_optimizer = torch.optim.AdamW(
+                list(self.clip_head.parameters()) + list(self.mae_head.parameters()),
+                lr=head_lr,
+            )
+            action_start_token = self.latent_sft_cfg.get("action_start_token", "<|action_start|>")
+            action_start_token_id = self.model_config.tokenizer.convert_tokens_to_ids(action_start_token)
+            self.loss_fn = partial(
+                sft_loss,
+                config=None,
+                clip_head=self.clip_head,
+                mae_head=self.mae_head,
+                action_start_token_id=action_start_token_id,
+                clip_coef=float(self.latent_sft_cfg.get("clip_coef", 1.0)),
+                mae_coef=float(self.latent_sft_cfg.get("mae_coef", 1.0)),
+            )
+        else:
+            self.loss_fn = partial(sft_loss, config=None)
 
         self.flops_counter = FlopsCounter(self.model_config.hf_config)
 
@@ -247,6 +278,7 @@ class SFTTrainer:
             "global_batch_size": self.global_batch_size,
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
+            "extract_latent": self.latent_sft_enable,
         }
 
         train_time = 0
@@ -269,8 +301,16 @@ class SFTTrainer:
                 data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
 
                 with self.engine.train_mode():
+                    if self.clip_head is not None:
+                        self.clip_head.train()
+                    if self.mae_head is not None:
+                        self.mae_head.train()
                     with Timer(name="update_policy", logger=None) as timer:
+                        if self.latent_head_optimizer is not None:
+                            self.latent_head_optimizer.zero_grad(set_to_none=True)
                         output = self.engine.train_batch(data=data, loss_function=self.loss_fn)
+                        if self.latent_head_optimizer is not None:
+                            self.latent_head_optimizer.step()
                 lr = self.engine.lr_scheduler_step()
 
                 if self.engine.is_mp_src_rank_with_outputs():
@@ -331,6 +371,10 @@ class SFTTrainer:
                     val_losses = []
                     for val_data in self.val_dataloader:
                         with self.engine.eval_mode():
+                            if self.clip_head is not None:
+                                self.clip_head.eval()
+                            if self.mae_head is not None:
+                                self.mae_head.eval()
                             # construct tensordict
                             val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
                             output = self.engine.infer_batch(data=val_data, loss_function=self.loss_fn)
@@ -383,8 +427,10 @@ def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1):
 
         dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
     else:
-        # Default to multi-turn dataset
-        dataset_cls = MultiTurnSFTDataset
+        if data_config.multiturn.enable:
+            dataset_cls = MultiTurnSFTDataset
+        else:
+            dataset_cls = SFTDataset
 
     # Create datasets based on the selected class
     dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config, max_samples=max_samples)

@@ -22,10 +22,21 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
+from verl.workers.roles.utils.latent_supervision import extract_action_start_latent
 from verl.workers.roles.utils.padding import no_padding_2_padding
 
 
-def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+def sft_loss(
+    config: ActorConfig,
+    model_output,
+    data: TensorDict,
+    dp_group=None,
+    clip_head=None,
+    mae_head=None,
+    action_start_token_id: int | None = None,
+    clip_coef: float = 1.0,
+    mae_coef: float = 1.0,
+):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
     batch_num_tokens = data["batch_num_tokens"]
@@ -51,7 +62,35 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         response_mask = data["response_mask"].to(bool)
         loss = -masked_sum(log_prob, response_mask) / batch_num_tokens * dp_size
 
-    return loss, {"loss": loss.detach().item()}
+    metrics = {"loss": loss.detach().item()}
+
+    if clip_head is not None and mae_head is not None and ("hidden_states" in model_output or "latent" in model_output) and "clip_gt" in data and "mae_gt" in data:
+        hidden_states = model_output.get("hidden_states", None)
+        if hidden_states is None:
+            hidden_states = model_output["latent"]
+            # Megatron latent may be [seq, bs, hidden].
+            if hidden_states.dim() == 3 and hidden_states.shape[0] == data["input_ids"].shape[1]:
+                hidden_states = hidden_states.transpose(0, 1).contiguous()
+        input_ids = data["input_ids"]
+        latent = extract_action_start_latent(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            action_start_token_id=action_start_token_id,
+        )
+        clip_pred = clip_head(latent)
+        mae_pred = mae_head(latent)
+        clip_gt = data["clip_gt"].to(clip_pred.device)
+        mae_gt = data["mae_gt"].to(mae_pred.device)
+        valid = data.get("latent_gt_valid", torch.ones(clip_gt.shape[0], device=clip_gt.device)).to(clip_pred.device)
+        valid = valid.reshape(-1, 1)
+        clip_loss = ((clip_pred - clip_gt) ** 2 * valid).mean()
+        mae_loss = ((mae_pred - mae_gt) ** 2 * valid).mean()
+        loss = loss + clip_coef * clip_loss + mae_coef * mae_loss
+        metrics["clip_loss"] = clip_loss.detach().item()
+        metrics["mae_loss"] = mae_loss.detach().item()
+        metrics["loss"] = loss.detach().item()
+
+    return loss, metrics
 
 
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None, state_encoder=None, transition_reward_net=None):

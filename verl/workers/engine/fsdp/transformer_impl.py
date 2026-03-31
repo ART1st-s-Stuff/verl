@@ -836,6 +836,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
         temperature = micro_batch["temperature"]
         calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+        extract_latent = tu.get_non_tensor_data(data=micro_batch, key="extract_latent", default=False)
 
         model_output = {}
 
@@ -933,6 +934,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
         model_output["log_probs"] = log_probs
         if calculate_entropy:
             model_output["entropy"] = entropy
+        if extract_latent and hasattr(output, "hidden_states") and output.hidden_states is not None:
+            # Use last-layer hidden states for latent supervision in SFT.
+            model_output["hidden_states"] = output.hidden_states[-1]
 
         return model_output
 
@@ -943,9 +947,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+            extract_latent = tu.get_non_tensor_data(data=micro_batch, key="extract_latent", default=False)
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,
+                output_hidden_states=extract_latent,
             )  # prevent model thinks we are generating
 
             model_output = self.prepare_model_outputs(

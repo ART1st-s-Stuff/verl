@@ -21,6 +21,7 @@ Each parquet file contains
 import numpy as np
 import pandas as pd
 import torch
+from PIL import Image
 from omegaconf.listconfig import ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
@@ -49,6 +50,8 @@ class SFTDataset(Dataset):
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.latent_sft_cfg = config.get("latent_sft", {})
+        self.latent_sft_enable = bool(self.latent_sft_cfg.get("enable", False))
 
         assert truncation in ["error", "left", "right"]
         self.truncation = truncation
@@ -72,6 +75,11 @@ class SFTDataset(Dataset):
 
         self._download()
         self._read_files_and_tokenize()
+
+        self._clip_processor = None
+        self._clip_model = None
+        self._mae_processor = None
+        self._mae_model = None
 
     def _download(self):
         for i, parquet_file in enumerate(self.parquet_files):
@@ -129,6 +137,49 @@ class SFTDataset(Dataset):
         if isinstance(self.responses, pd.DataFrame):
             self.responses = self.responses.squeeze()
         self.responses = self.responses.tolist()
+
+        if self.latent_sft_enable:
+            self.clip_gt_col = self.dataframe["clip_gt"] if "clip_gt" in self.dataframe.columns else None
+            self.mae_gt_col = self.dataframe["mae_gt"] if "mae_gt" in self.dataframe.columns else None
+            self.image_path_col = self.dataframe["image_path"] if "image_path" in self.dataframe.columns else None
+            self.image_bytes_col = self.dataframe["image_bytes"] if "image_bytes" in self.dataframe.columns else None
+
+    def _lazy_init_feature_models(self):
+        if self._clip_model is not None and self._mae_model is not None:
+            return
+        clip_name = self.latent_sft_cfg.get("clip_model_name", "openai/clip-vit-base-patch32")
+        mae_name = self.latent_sft_cfg.get("mae_model_name", "facebook/vit-mae-base")
+        from transformers import CLIPModel, CLIPProcessor, ViTMAEModel, ViTImageProcessor
+
+        self._clip_processor = CLIPProcessor.from_pretrained(clip_name)
+        self._clip_model = CLIPModel.from_pretrained(clip_name).eval()
+        self._mae_processor = ViTImageProcessor.from_pretrained(mae_name)
+        self._mae_model = ViTMAEModel.from_pretrained(mae_name).eval()
+
+    def _compute_gt_features_from_image(self, image: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:
+        self._lazy_init_feature_models()
+        with torch.no_grad():
+            clip_inputs = self._clip_processor(images=image, return_tensors="pt")
+            clip_feat = self._clip_model.get_image_features(**clip_inputs).squeeze(0).to(torch.float32)
+            clip_feat = torch.nn.functional.normalize(clip_feat, dim=-1)
+
+            mae_inputs = self._mae_processor(images=image, return_tensors="pt")
+            mae_out = self._mae_model(**mae_inputs)
+            mae_feat = mae_out.last_hidden_state.mean(dim=1).squeeze(0).to(torch.float32)
+        return clip_feat, mae_feat
+
+    def _try_load_image(self, item: int) -> Image.Image | None:
+        if self.image_path_col is not None:
+            path = self.image_path_col.iloc[item]
+            if isinstance(path, str) and path:
+                return Image.open(path).convert("RGB")
+        if self.image_bytes_col is not None:
+            img_bytes = self.image_bytes_col.iloc[item]
+            if img_bytes is not None:
+                import io
+
+                return Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        return None
 
     def __len__(self):
         return len(self.prompts)
@@ -201,4 +252,33 @@ class SFTDataset(Dataset):
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "loss_mask": loss_mask,
-        }
+        } | self._get_latent_supervision_fields(item)
+
+    def _get_latent_supervision_fields(self, item: int) -> dict[str, torch.Tensor]:
+        if not self.latent_sft_enable:
+            return {}
+        clip_gt = None
+        mae_gt = None
+        if self.clip_gt_col is not None:
+            raw = self.clip_gt_col.iloc[item]
+            if raw is not None and not (isinstance(raw, float) and np.isnan(raw)):
+                clip_gt = torch.tensor(raw, dtype=torch.float32)
+        if self.mae_gt_col is not None:
+            raw = self.mae_gt_col.iloc[item]
+            if raw is not None and not (isinstance(raw, float) and np.isnan(raw)):
+                mae_gt = torch.tensor(raw, dtype=torch.float32)
+
+        hybrid_fill = bool(self.latent_sft_cfg.get("hybrid_fill", {}).get("enable", False))
+        if (clip_gt is None or mae_gt is None) and hybrid_fill:
+            image = self._try_load_image(item)
+            if image is not None:
+                clip_gt, mae_gt = self._compute_gt_features_from_image(image)
+
+        if clip_gt is None or mae_gt is None:
+            # Keep batch shape valid; mask out in loss.
+            clip_gt = torch.zeros(self.latent_sft_cfg.get("clip_feature_dim", 512), dtype=torch.float32)
+            mae_gt = torch.zeros(self.latent_sft_cfg.get("mae_feature_dim", 768), dtype=torch.float32)
+            valid = torch.tensor(0.0, dtype=torch.float32)
+        else:
+            valid = torch.tensor(1.0, dtype=torch.float32)
+        return {"clip_gt": clip_gt, "mae_gt": mae_gt, "latent_gt_valid": valid}

@@ -30,6 +30,19 @@ data:
     name: null
   use_shm: False
   apply_chat_template_kwargs: {}
+  latent_sft:
+    enable: false
+    action_start_token: "<|action_start|>"
+    clip_coef: 1.0
+    mae_coef: 1.0
+    clip_feature_dim: 512
+    mae_feature_dim: 768
+    head_hidden_dim: null
+    head_lr: 1e-4
+    clip_model_name: openai/clip-vit-base-patch32
+    mae_model_name: facebook/vit-mae-base
+    hybrid_fill:
+      enable: false
 model:
   partial_pretrain: ~/models/gemma-1.1-7b-it
   use_shm: False

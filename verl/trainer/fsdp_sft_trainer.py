@@ -815,9 +815,12 @@ def run_sft(config):
     train_dataset = create_sft_dataset(
         config.data.train_files, config.data, tokenizer, max_samples=config.data.get("train_max_samples", -1)
     )
-    val_dataset = create_sft_dataset(
-        config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
-    )
+    if config.data.val_files:
+        val_dataset = create_sft_dataset(
+            config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
+        )
+    else:
+        val_dataset = None
 
     trainer = FSDPSFTTrainer(
         config=config,

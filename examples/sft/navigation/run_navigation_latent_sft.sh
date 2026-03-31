@@ -1,26 +1,37 @@
 set -x
 
 if [ "$#" -lt 3 ]; then
-    echo "Usage: run_navigation_latent_sft.sh <nproc_per_node> <train_parquet> <save_path> [other_configs...]"
+    echo "Usage: run_navigation_latent_sft.sh <nproc_per_node> <train_parquet> <save_path> [val_parquet] [other_configs...]"
     exit 1
 fi
 
 nproc_per_node=$1
 train_parquet=$2
 save_path=$3
-shift 3
+val_parquet=${4:-}
+if [ -n "$val_parquet" ] && [[ "$val_parquet" != *=* ]]; then
+    shift 4
+else
+    val_parquet=""
+    shift 3
+fi
+
+val_override="data.val_files=null trainer.test_freq=-1"
+if [ -n "$val_parquet" ]; then
+    val_override="data.val_files=$val_parquet"
+fi
 
 torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     -m verl.trainer.fsdp_sft_trainer \
     data.train_files=$train_parquet \
-    data.val_files=null \
+    $val_override \
     data.prompt_key=prompt \
     data.response_key=response \
     data.max_length=2048 \
     data.micro_batch_size_per_gpu=1 \
     data.latent_sft.enable=true \
     data.latent_sft.hybrid_fill.enable=true \
-    data.latent_sft.action_start_token="<|action_start|>" \
+    "data.latent_sft.action_start_token='<|action_start|>'" \
     model.partial_pretrain=Qwen/Qwen2.5-0.5B-Instruct \
     model.lora_rank=32 \
     model.lora_alpha=16 \

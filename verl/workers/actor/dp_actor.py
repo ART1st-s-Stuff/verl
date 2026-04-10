@@ -486,6 +486,9 @@ class DataParallelPPOActor(BasePPOActor):
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
+                    micro_batch_metrics["actor/world_model_enabled"] = (
+                        1.0 if (self.state_encoder is not None and self.transition_reward_net is not None) else 0.0
+                    )
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
@@ -591,6 +594,7 @@ class DataParallelPPOActor(BasePPOActor):
                         reward_loss = F.mse_loss(pred_reward, reward_target)
                         policy_loss = policy_loss + self.config.reward_loss_coef * reward_loss
                         micro_batch_metrics["actor/reward_loss"] = reward_loss.detach().item() * loss_scale_factor
+                        world_model_loss = self.config.reward_loss_coef * reward_loss.detach()
 
                         if "next_latent" in model_inputs:
                             next_latent = model_inputs["next_latent"]
@@ -601,6 +605,10 @@ class DataParallelPPOActor(BasePPOActor):
                             state_loss = F.mse_loss(pred_next_state, target_next_state)
                             policy_loss = policy_loss + self.config.state_loss_coef * state_loss
                             micro_batch_metrics["actor/state_loss"] = state_loss.detach().item() * loss_scale_factor
+                            world_model_loss = world_model_loss + self.config.state_loss_coef * state_loss.detach()
+                        micro_batch_metrics["actor/world_model_loss"] = world_model_loss.item() * loss_scale_factor
+                    elif self.state_encoder is not None and self.transition_reward_net is not None:
+                        micro_batch_metrics["actor/world_model_supervision_missing"] = 1.0 * loss_scale_factor
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

@@ -54,6 +54,14 @@ ACTION_TOKENS = [
 ]
 
 
+def _can_enable_world_model(config: ActorConfig) -> bool:
+    return config.num_actions > 0 and config.world_state_dim > 0
+
+
+def _can_enable_latent_mcts(config: ActorConfig) -> bool:
+    return _can_enable_world_model(config) and config.enable_latent_mcts
+
+
 class ActorWorker(Worker, DistProfilerExtension):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -111,7 +119,7 @@ class ActorWorker(Worker, DistProfilerExtension):
         self.transition_reward_net = None
         self.world_model_optimizer = None
         self.mcts_planner = None
-        if self.config.num_actions > 0 and self.config.world_state_dim > 0:
+        if _can_enable_world_model(self.config):
             hidden_size = self.model_config.hf_config.hidden_size
             transition_hidden_dim = self.config.transition_hidden_dim or hidden_size
             self.state_encoder = LatentStateEncoder(hidden_size, self.config.world_state_dim).to(get_device_id())
@@ -190,7 +198,9 @@ class ActorWorker(Worker, DistProfilerExtension):
                 entropy = no_padding_2_padding(entropy, data)  # (bsz, response_length)
 
             # in megatron, only last pp contains valid data and returned to the single controller
-            output_tensors = {"old_log_probs": log_probs.float(), "entropy": entropy.float()}
+            output_tensors = {"old_log_probs": log_probs.float()}
+            if entropy is not None:
+                output_tensors["entropys"] = entropy.float()
             output_non_tensors = {}
             if extract_latent and "latent" in output:
                 # Keep only the last token latent for each sample.
@@ -201,7 +211,7 @@ class ActorWorker(Worker, DistProfilerExtension):
                     latent_input = latent.detach() if self.config.action_head_detach_latent else latent
                     world_state = self.state_encoder(latent_input)
                     output_tensors["world_state"] = world_state
-                    if self.config.enable_latent_mcts and self.mcts_planner is not None:
+                    if _can_enable_latent_mcts(self.config) and self.mcts_planner is not None:
                         action_ids = self.mcts_planner.plan(world_state)
                         output_tensors["planned_action_ids"] = action_ids
                         if self.config.num_actions <= len(ACTION_TOKENS):

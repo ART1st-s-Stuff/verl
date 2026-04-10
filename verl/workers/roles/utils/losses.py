@@ -103,14 +103,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         metrics["kl_loss"] = kl_loss.detach().item()
         metrics["kl_coef"] = config.kl_loss_coef
 
+    world_model_enabled = state_encoder is not None and transition_reward_net is not None
+    metrics["actor/world_model_enabled"] = 1.0 if world_model_enabled else 0.0
+
     # optional latent world-model loss branch
-    if (
-        state_encoder is not None
-        and transition_reward_net is not None
-        and "action_labels" in data
-        and "step_rewards" in data
-        and "latent" in model_output
-    ):
+    if world_model_enabled and "action_labels" in data and "step_rewards" in data and "latent" in model_output:
         latent = model_output["latent"]
         latent_last = latent.values()[latent.offsets()[1:] - 1]
         if config.action_head_detach_latent:
@@ -124,6 +121,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         reward_loss = F.mse_loss(pred_reward, reward_target)
         policy_loss = policy_loss + config.reward_loss_coef * reward_loss
         metrics["actor/reward_loss"] = reward_loss.detach().item()
+        metrics["actor/world_model_loss"] = (config.reward_loss_coef * reward_loss.detach()).item()
 
         if "next_latent" in data:
             next_latent = data["next_latent"]
@@ -134,6 +132,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
             state_loss = F.mse_loss(pred_next_state, target_next_state)
             policy_loss = policy_loss + config.state_loss_coef * state_loss
             metrics["actor/state_loss"] = state_loss.detach().item()
+            metrics["actor/world_model_loss"] += (config.state_loss_coef * state_loss.detach()).item()
+    elif world_model_enabled:
+        metrics["actor/world_model_supervision_missing"] = 1.0
 
     return policy_loss, metrics
 

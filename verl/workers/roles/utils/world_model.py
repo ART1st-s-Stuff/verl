@@ -2,6 +2,16 @@ import torch
 import torch.nn as nn
 
 
+def cast_tensor_to_module_dtype(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
+    """Cast floating-point inputs to match a module's parameter dtype."""
+    if not tensor.is_floating_point():
+        return tensor
+    param = next(module.parameters(), None)
+    if param is None or tensor.dtype == param.dtype:
+        return tensor
+    return tensor.to(dtype=param.dtype)
+
+
 class LatentStateEncoder(nn.Module):
     """Map LLM latent vector to compact world state."""
 

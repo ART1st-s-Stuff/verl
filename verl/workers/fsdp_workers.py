@@ -88,6 +88,8 @@ from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.ray_utils import get_event_loop
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
+from verl.workers.roles.utils.action_schema import ACTION_TOKENS
+from verl.workers.roles.utils.world_model import cast_tensor_to_module_dtype
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
@@ -95,16 +97,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
-ACTION_TOKENS = [
-    "<|act_moveahead|>",
-    "<|act_moveback|>",
-    "<|act_moveright|>",
-    "<|act_moveleft|>",
-    "<|act_rotateright|>",
-    "<|act_rotateleft|>",
-    "<|act_lookup|>",
-    "<|act_lookdown|>",
-]
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -1013,6 +1005,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 output_tensors["latent"] = latent
                 if self.actor.state_encoder is not None:
                     latent_input = latent.detach() if self.config.actor.action_head_detach_latent else latent
+                    latent_input = cast_tensor_to_module_dtype(latent_input, self.actor.state_encoder)
                     world_state = self.actor.state_encoder(latent_input)
                     output_tensors["world_state"] = world_state
                     if self.config.actor.enable_latent_mcts and self.actor.mcts_planner is not None:

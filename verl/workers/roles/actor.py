@@ -34,24 +34,15 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension
 from verl.utils.py_functional import append_to_dict
 from verl.workers.config import ActorConfig
 from verl.workers.roles.utils.losses import ppo_loss
+from verl.workers.roles.utils.action_schema import ACTION_TOKENS
 from verl.workers.roles.utils.mcts_planner import MCTSPlanner, MCTSPlannerConfig
 from verl.workers.roles.utils.padding import left_right_2_no_padding, no_padding_2_padding
-from verl.workers.roles.utils.world_model import LatentStateEncoder, TransitionRewardNet
+from verl.workers.roles.utils.world_model import LatentStateEncoder, TransitionRewardNet, cast_tensor_to_module_dtype
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
-ACTION_TOKENS = [
-    "<|act_moveahead|>",
-    "<|act_moveback|>",
-    "<|act_moveright|>",
-    "<|act_moveleft|>",
-    "<|act_rotateright|>",
-    "<|act_rotateleft|>",
-    "<|act_lookup|>",
-    "<|act_lookdown|>",
-]
 
 
 def _can_enable_world_model(config: ActorConfig) -> bool:
@@ -60,6 +51,12 @@ def _can_enable_world_model(config: ActorConfig) -> bool:
 
 def _can_enable_latent_mcts(config: ActorConfig) -> bool:
     return _can_enable_world_model(config) and config.enable_latent_mcts
+
+
+def _mcts_cfg_value(mcts_cfg, key: str, default):
+    if isinstance(mcts_cfg, dict):
+        return mcts_cfg.get(key, default)
+    return getattr(mcts_cfg, key, default)
 
 
 class ActorWorker(Worker, DistProfilerExtension):
@@ -143,11 +140,11 @@ class ActorWorker(Worker, DistProfilerExtension):
                 transition_model=self.transition_reward_net,
                 num_actions=self.config.num_actions,
                 config=MCTSPlannerConfig(
-                    depth=self.config.mcts.depth,
-                    branching=self.config.mcts.branching,
-                    c_puct=self.config.mcts.c_puct,
-                    rollout_steps=self.config.mcts.rollout_steps,
-                    discount=self.config.mcts.discount,
+                    depth=_mcts_cfg_value(self.config.mcts, "depth", 3),
+                    branching=_mcts_cfg_value(self.config.mcts, "branching", 8),
+                    c_puct=_mcts_cfg_value(self.config.mcts, "c_puct", 1.0),
+                    rollout_steps=_mcts_cfg_value(self.config.mcts, "rollout_steps", 1),
+                    discount=_mcts_cfg_value(self.config.mcts, "discount", 0.99),
                 ),
             )
 
@@ -209,6 +206,7 @@ class ActorWorker(Worker, DistProfilerExtension):
                 output_tensors["latent"] = latent
                 if self.state_encoder is not None:
                     latent_input = latent.detach() if self.config.action_head_detach_latent else latent
+                    latent_input = cast_tensor_to_module_dtype(latent_input, self.state_encoder)
                     world_state = self.state_encoder(latent_input)
                     output_tensors["world_state"] = world_state
                     if _can_enable_latent_mcts(self.config) and self.mcts_planner is not None:

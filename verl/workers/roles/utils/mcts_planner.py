@@ -21,21 +21,28 @@ class MCTSPlanner:
         self.config = config
 
     @torch.no_grad()
-    def plan(self, world_state: torch.Tensor) -> torch.Tensor:
+    def plan(self, world_state: torch.Tensor, candidate_action_ids: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             world_state: [bs, state_dim]
+            candidate_action_ids: optional [bs, k] candidate ids ranked by prior
         Returns:
             action_ids: [bs]
         """
         bs = world_state.shape[0]
         device = world_state.device
-        action_space = torch.arange(self.num_actions, device=device, dtype=torch.long)
+        if candidate_action_ids is None:
+            candidate_action_ids = torch.arange(self.num_actions, device=device, dtype=torch.long).unsqueeze(0).expand(bs, -1)
+        elif candidate_action_ids.dim() != 2:
+            raise ValueError(
+                f"Expected candidate_action_ids with shape [bs, k], got {tuple(candidate_action_ids.shape)}"
+            )
+        candidate_action_ids = candidate_action_ids.to(device=device, dtype=torch.long)
 
         best_action = torch.zeros(bs, dtype=torch.long, device=device)
         best_value = torch.full((bs,), -1e9, device=device)
-        for action in action_space:
-            act = torch.full((bs,), int(action.item()), dtype=torch.long, device=device)
+        for idx in range(candidate_action_ids.shape[1]):
+            act = candidate_action_ids[:, idx]
             v = self._rollout(world_state, act, self.config.depth)
             better = v > best_value
             best_value = torch.where(better, v, best_value)

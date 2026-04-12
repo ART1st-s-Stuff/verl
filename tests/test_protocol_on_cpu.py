@@ -312,6 +312,30 @@ def test_concat_non_list_metrics():
     assert concat_data.meta_info["metrics"] == expected_metrics
 
 
+def test_concat_metrics_with_different_worker_keys():
+    """Test that concat() preserves sparse metric keys across workers."""
+    obs1 = torch.tensor([1, 2])
+    obs2 = torch.tensor([3, 4])
+
+    data1 = DataProto.from_dict(
+        tensors={"obs": obs1},
+        meta_info={"metrics": {"actor/reward_loss": [0.5], "actor/world_model_loss": [1.2]}},
+    )
+    data2 = DataProto.from_dict(
+        tensors={"obs": obs2},
+        meta_info={"metrics": {"actor/state_loss": [0.8], "actor/world_model_loss": [1.0]}},
+    )
+
+    concat_data = DataProto.concat([data1, data2])
+
+    expected_metrics = {
+        "actor/reward_loss": [[0.5]],
+        "actor/state_loss": [[0.8]],
+        "actor/world_model_loss": [[1.2], [1.0]],
+    }
+    assert concat_data.meta_info["metrics"] == expected_metrics
+
+
 def test_concat_merge_different_non_metric_keys():
     """Test that concat() merges non-metric meta_info keys from all workers.
 

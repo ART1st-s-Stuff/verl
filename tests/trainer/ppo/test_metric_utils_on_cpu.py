@@ -66,6 +66,19 @@ class TestReduceMetrics(unittest.TestCase):
 
         self.assertEqual(result["single"], 5.0)
 
+    def test_reduce_metrics_nested_worker_values(self):
+        """Test that reduce_metrics flattens ragged worker-local metric lists."""
+        metrics = {
+            "loss": [[1.0, 2.0], [3.0]],
+            "max_reward": [[5.0], [8.0, 6.0]],
+            "min_error": [[0.1, 0.05], [0.2]],
+        }
+        result = reduce_metrics(metrics)
+
+        self.assertEqual(result["loss"], 2.0)
+        self.assertEqual(result["max_reward"], 8.0)
+        self.assertEqual(result["min_error"], 0.05)
+
 
 class TestComputeDataMetrics(unittest.TestCase):
     """Tests for the compute_data_metrics function."""

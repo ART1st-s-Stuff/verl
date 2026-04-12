@@ -88,7 +88,7 @@ from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.ray_utils import get_event_loop
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
-from verl.workers.roles.utils.action_schema import ACTION_TOKENS
+from verl.workers.roles.utils.action_schema import ACTION_TOKENS, compute_action_prior_from_latent
 from verl.workers.roles.utils.world_model import cast_tensor_to_module_dtype
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
@@ -97,6 +97,12 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _mcts_cfg_value(mcts_cfg, key: str, default):
+    if isinstance(mcts_cfg, dict):
+        return mcts_cfg.get(key, default)
+    return getattr(mcts_cfg, key, default)
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -824,7 +830,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                processing_class=self.processor if self.processor is not None else self.tokenizer,
             )
 
         if self._is_rollout:
@@ -854,7 +863,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
-            self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            self.ref_policy = DataParallelPPOActor(
+                config=self.config.ref,
+                actor_module=self.ref_module_fsdp,
+                processing_class=self.processor if self.processor is not None else self.tokenizer,
+            )
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -1008,8 +1021,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     latent_input = cast_tensor_to_module_dtype(latent_input, self.actor.state_encoder)
                     world_state = self.actor.state_encoder(latent_input)
                     output_tensors["world_state"] = world_state
+                    action_prior_tensors = compute_action_prior_from_latent(
+                        latent_z=latent,
+                        output_head_owner=self.actor_module_fsdp,
+                        processing_class=self.processor if self.processor is not None else self.tokenizer,
+                        num_actions=self.config.actor.num_actions,
+                        temperature=self.config.rollout.temperature,
+                    )
+                    output_tensors.update(action_prior_tensors)
                     if self.config.actor.enable_latent_mcts and self.actor.mcts_planner is not None:
-                        action_ids = self.actor.mcts_planner.plan(world_state)
+                        candidate_action_ids = None
+                        if "action_prior_probs" in action_prior_tensors:
+                            topk = min(
+                                self.config.actor.num_actions,
+                                _mcts_cfg_value(self.config.actor.mcts, "branching", 8),
+                            )
+                            candidate_action_ids = action_prior_tensors["action_prior_probs"].topk(topk, dim=-1).indices
+                        action_ids = self.actor.mcts_planner.plan(world_state, candidate_action_ids=candidate_action_ids)
                         output_tensors["planned_action_ids"] = action_ids
                         if self.config.actor.num_actions <= len(ACTION_TOKENS):
                             output_non_tensors["planned_action_tokens"] = [

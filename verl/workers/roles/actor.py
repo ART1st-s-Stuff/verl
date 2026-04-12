@@ -34,10 +34,16 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension
 from verl.utils.py_functional import append_to_dict
 from verl.workers.config import ActorConfig
 from verl.workers.roles.utils.losses import ppo_loss
-from verl.workers.roles.utils.action_schema import ACTION_TOKENS
+from verl.workers.roles.utils.action_schema import ACTION_TOKENS, compute_action_prior_from_latent, get_action_start_token_id
 from verl.workers.roles.utils.mcts_planner import MCTSPlanner, MCTSPlannerConfig
 from verl.workers.roles.utils.padding import left_right_2_no_padding, no_padding_2_padding
-from verl.workers.roles.utils.world_model import LatentStateEncoder, TransitionRewardNet, cast_tensor_to_module_dtype
+from verl.workers.roles.utils.world_model import (
+    LatentStateEncoder,
+    TransitionRewardNet,
+    canonicalize_latent_z,
+    cast_tensor_to_module_dtype,
+    extract_latent_z,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -200,17 +206,31 @@ class ActorWorker(Worker, DistProfilerExtension):
                 output_tensors["entropys"] = entropy.float()
             output_non_tensors = {}
             if extract_latent and "latent" in output:
-                # Keep only the last token latent for each sample.
-                latent = output["latent"]
-                latent = latent.values()[latent.offsets()[1:] - 1]
+                latent = extract_latent_z(
+                    latent=output["latent"],
+                    input_ids=data["input_ids"],
+                    anchor_token_id=get_action_start_token_id(self.model_config.get_processor()),
+                )
                 output_tensors["latent"] = latent
+                action_prior_tensors = compute_action_prior_from_latent(
+                    latent_z=latent,
+                    output_head_owner=self.engine.module,
+                    processing_class=self.model_config.get_processor(),
+                    num_actions=self.config.num_actions,
+                    temperature=1.0,
+                )
+                output_tensors.update(action_prior_tensors)
                 if self.state_encoder is not None:
                     latent_input = latent.detach() if self.config.action_head_detach_latent else latent
                     latent_input = cast_tensor_to_module_dtype(latent_input, self.state_encoder)
                     world_state = self.state_encoder(latent_input)
                     output_tensors["world_state"] = world_state
                     if _can_enable_latent_mcts(self.config) and self.mcts_planner is not None:
-                        action_ids = self.mcts_planner.plan(world_state)
+                        candidate_action_ids = None
+                        if "action_prior_probs" in action_prior_tensors:
+                            topk = min(self.config.num_actions, _mcts_cfg_value(self.config.mcts, "branching", 8))
+                            candidate_action_ids = action_prior_tensors["action_prior_probs"].topk(topk, dim=-1).indices
+                        action_ids = self.mcts_planner.plan(world_state, candidate_action_ids=candidate_action_ids)
                         output_tensors["planned_action_ids"] = action_ids
                         if self.config.num_actions <= len(ACTION_TOKENS):
                             output_non_tensors["planned_action_tokens"] = [

@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -40,8 +41,14 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+from verl.workers.roles.utils.action_schema import get_action_start_token_id
 from verl.workers.roles.utils.mcts_planner import MCTSPlanner, MCTSPlannerConfig
-from verl.workers.roles.utils.world_model import LatentStateEncoder, TransitionRewardNet, cast_tensor_to_module_dtype
+from verl.workers.roles.utils.world_model import (
+    LatentStateEncoder,
+    TransitionRewardNet,
+    cast_tensor_to_module_dtype,
+    extract_latent_z,
+)
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -64,11 +71,21 @@ class DataParallelPPOActor(BasePPOActor):
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
     """
 
-    def __init__(self, config: ActorConfig, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self,
+        config: ActorConfig,
+        actor_module: nn.Module,
+        actor_optimizer: torch.optim.Optimizer = None,
+        processing_class: Any = None,
+    ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.processing_class = processing_class
+        self.action_start_token_id = (
+            get_action_start_token_id(processing_class) if processing_class is not None else None
+        )
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -328,9 +345,12 @@ class DataParallelPPOActor(BasePPOActor):
                     hidden_states = getattr(output, "hidden_states", None)
                     if hidden_states is not None and len(hidden_states) > 0:
                         seq_hidden = hidden_states[-1]
-                        last_indices = attention_mask.long().sum(dim=1) - 1
-                        batch_indices = torch.arange(seq_hidden.shape[0], device=seq_hidden.device)
-                        latent_last = seq_hidden[batch_indices, last_indices]
+                        latent_last = extract_latent_z(
+                            latent=seq_hidden,
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            anchor_token_id=self.action_start_token_id,
+                        )
 
             return entropy, log_probs, latent_last
 

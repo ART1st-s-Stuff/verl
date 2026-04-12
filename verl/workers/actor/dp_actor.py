@@ -462,6 +462,18 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
 
+        if self.state_encoder is not None and self.transition_reward_net is not None:
+            world_model_batch_keys = (
+                "action_labels",
+                "step_rewards",
+                "action_label_mask",
+                "next_latent",
+                "next_latent_mask",
+            )
+            for key in world_model_batch_keys:
+                if key in data.batch.keys():
+                    select_keys.append(key)
+
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 

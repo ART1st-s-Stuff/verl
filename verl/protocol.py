@@ -198,14 +198,22 @@ def union_numpy_dict(tensor_dict1: dict[str, np.ndarray], tensor_dict2: dict[str
     return tensor_dict1
 
 
-def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
+def list_of_dict_to_dict_of_list(list_of_dict: list[dict], *, allow_missing_keys: bool = False):
     if len(list_of_dict) == 0:
         return {}
-    keys = list_of_dict[0].keys()
+    if allow_missing_keys:
+        keys = []
+        for data in list_of_dict:
+            for key in data.keys():
+                if key not in keys:
+                    keys.append(key)
+    else:
+        keys = list(list_of_dict[0].keys())
     output = {key: [] for key in keys}
     for data in list_of_dict:
         for key, item in data.items():
-            assert key in output
+            if not allow_missing_keys:
+                assert key in output
             output[key].append(item)
     return output
 
@@ -962,7 +970,7 @@ class DataProto:
 
             # Flatten list of dicts to dict of lists for consistent metrics structure
             if all_metrics:
-                merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
+                merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics, allow_missing_keys=True)
 
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)

@@ -66,6 +66,7 @@ from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
+from verl.workers.roles.utils.action_schema import maybe_resize_token_embeddings
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 from ..base import BaseEngine, EngineRegistry
@@ -209,6 +210,7 @@ class FSDPEngine(BaseEngine):
                 config=self.model_config.hf_config,
                 trust_remote_code=self.model_config.trust_remote_code,
             )
+            maybe_resize_token_embeddings(module, self.model_config.get_processor())
 
             use_liger = self.model_config.use_liger
             # Apply Liger kernel to the model if use_liger is set to True

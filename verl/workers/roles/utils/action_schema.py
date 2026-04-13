@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 ACTION_START_TOKEN = "<|action_start|>"
 ACTION_END_TOKEN = "<|action_end|>"
+LATENT_TOKEN = "<|latent|>"
 
 ACTION_TOKEN_TO_NAME: dict[str, str] = {
     "<|act_moveahead|>": "move_forward",
@@ -40,10 +41,21 @@ ACTION_NAME_ALIASES: dict[str, str] = {
     "lookdown": "look_down",
 }
 
+PLANNER_SPECIAL_TOKENS: tuple[str, ...] = (
+    LATENT_TOKEN,
+    ACTION_START_TOKEN,
+    ACTION_END_TOKEN,
+)
+
 
 def normalize_action_name(name: str) -> str:
     canonical_name = str(name).lower().strip()
     return ACTION_NAME_ALIASES.get(canonical_name, canonical_name)
+
+
+def get_special_tokens(num_actions: int | None = None) -> tuple[str, ...]:
+    ordered_tokens = [*PLANNER_SPECIAL_TOKENS, *get_action_tokens(num_actions)]
+    return tuple(dict.fromkeys(ordered_tokens))
 
 
 def get_action_tokens(num_actions: int | None = None) -> tuple[str, ...]:
@@ -83,6 +95,40 @@ def get_special_token_id(processing_class: Any, token: str) -> int:
 
 def get_action_start_token_id(processing_class: Any) -> int:
     return get_special_token_id(processing_class, ACTION_START_TOKEN)
+
+
+def get_latent_token_id(processing_class: Any) -> int:
+    return get_special_token_id(processing_class, LATENT_TOKEN)
+
+
+def register_special_tokens(processing_class: Any, num_actions: int | None = None) -> int:
+    tokenizer = _get_tokenizer_from_processing_class(processing_class)
+    if tokenizer is None or not hasattr(tokenizer, "add_special_tokens"):
+        return 0
+
+    existing_tokens = set(getattr(tokenizer, "get_vocab", lambda: {})().keys())
+    missing_tokens = [token for token in get_special_tokens(num_actions) if token not in existing_tokens]
+    if not missing_tokens:
+        return 0
+
+    return int(tokenizer.add_special_tokens({"additional_special_tokens": missing_tokens}))
+
+
+def maybe_resize_token_embeddings(model: Any, processing_class: Any) -> bool:
+    tokenizer = _get_tokenizer_from_processing_class(processing_class)
+    if tokenizer is None or not hasattr(model, "resize_token_embeddings"):
+        return False
+
+    input_embeddings = model.get_input_embeddings()
+    if input_embeddings is None or not hasattr(input_embeddings, "num_embeddings"):
+        return False
+
+    target_vocab_size = len(tokenizer)
+    if int(input_embeddings.num_embeddings) == int(target_vocab_size):
+        return False
+
+    model.resize_token_embeddings(target_vocab_size)
+    return True
 
 
 def get_action_token_id_tensor(

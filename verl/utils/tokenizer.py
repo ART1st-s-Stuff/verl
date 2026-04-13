@@ -15,6 +15,8 @@
 
 import warnings
 
+from verl.workers.roles.utils.action_schema import register_special_tokens
+
 __all__ = ["hf_tokenizer", "hf_processor"]
 
 
@@ -60,6 +62,7 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
     if correct_pad_token:
         set_pad_token_id(tokenizer)
+    register_special_tokens(tokenizer)
     return tokenizer
 
 
@@ -85,4 +88,6 @@ def hf_processor(name_or_path, **kwargs):
     # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/auto/processing_auto.py#L344
     if processor is not None and "Processor" not in processor.__class__.__name__:
         processor = None
+    if processor is not None:
+        register_special_tokens(processor)
     return processor

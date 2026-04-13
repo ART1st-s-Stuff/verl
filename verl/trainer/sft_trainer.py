@@ -14,6 +14,7 @@
 
 
 import os
+import inspect
 from functools import partial
 
 os.environ["NCCL_DEBUG"] = "WARN"
@@ -143,12 +144,21 @@ class SFTTrainer:
     def _build_dataset(self):
         config = self.config
         tokenizer = self.model_config.tokenizer
+        processor = self.model_config.processor
         train_dataset = create_sft_dataset(
-            config.data.train_files, config.data, tokenizer, max_samples=config.data.get("train_max_samples", -1)
+            config.data.train_files,
+            config.data,
+            tokenizer,
+            max_samples=config.data.get("train_max_samples", -1),
+            processor=processor,
         )
         if config.data.val_files:
             val_dataset = create_sft_dataset(
-                config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
+                config.data.val_files,
+                config.data,
+                tokenizer,
+                max_samples=config.data.get("val_max_samples", -1),
+                processor=processor,
             )
         else:
             val_dataset = None
@@ -374,7 +384,7 @@ def main(config):
     run_sft(config)
 
 
-def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1):
+def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1, processor=None):
     """Create a dataset."""
     # build dataset
     # First check if a custom dataset class is specified
@@ -387,7 +397,15 @@ def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1):
         dataset_cls = MultiTurnSFTDataset
 
     # Create datasets based on the selected class
-    dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config, max_samples=max_samples)
+    dataset_kwargs = {
+        "parquet_files": data_paths,
+        "tokenizer": tokenizer,
+        "config": data_config,
+        "max_samples": max_samples,
+    }
+    if "processor" in inspect.signature(dataset_cls.__init__).parameters:
+        dataset_kwargs["processor"] = processor
+    dataset = dataset_cls(**dataset_kwargs)
     return dataset
 
 

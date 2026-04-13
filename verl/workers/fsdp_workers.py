@@ -88,7 +88,7 @@ from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.ray_utils import get_event_loop
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
-from verl.workers.roles.utils.action_schema import ACTION_TOKENS, compute_action_prior_from_latent
+from verl.workers.roles.utils.action_schema import ACTION_TOKENS, compute_action_prior_from_latent, maybe_resize_token_embeddings
 from verl.workers.roles.utils.world_model import cast_tensor_to_module_dtype
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
@@ -390,6 +390,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
             )
+            maybe_resize_token_embeddings(actor_module, self.processor if self.processor is not None else self.tokenizer)
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -1353,6 +1354,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 critic_model_config,
                 config.model.get("trust_remote_code", False),
             )
+            maybe_resize_token_embeddings(critic_module, self.processor if self.processor is not None else self.tokenizer)
 
             use_remove_padding = config.model.get("use_remove_padding", False)
 

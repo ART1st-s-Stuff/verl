@@ -15,12 +15,49 @@
 
 import ctypes
 import os
+import sys
 from datetime import timedelta
 
 import ray
 import torch.distributed
 
 from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device, is_npu_available
+
+
+def _read_parent_cmdline() -> str:
+    try:
+        with open(f"/proc/{os.getppid()}/cmdline", "rb") as f:
+            return f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def _should_fail_fast_interactive_launch() -> tuple[bool, dict]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    parent_cmdline = _read_parent_cmdline()
+    stdin_is_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    has_dist_init_method = bool(os.environ.get("DIST_INIT_METHOD"))
+    has_torchrun_marker = bool(os.environ.get("TORCHELASTIC_RUN_ID"))
+    has_master_addr = bool(os.environ.get("MASTER_ADDR"))
+    has_master_port = bool(os.environ.get("MASTER_PORT"))
+    interactive_shell_parent = any(shell in parent_cmdline for shell in ("bash", "zsh", "fish", "sh "))
+
+    should_fail = (
+        world_size > 1
+        and interactive_shell_parent
+        and stdin_is_tty
+        and not has_dist_init_method
+        and not has_torchrun_marker
+    )
+    return should_fail, {
+        "world_size": world_size,
+        "parent_cmdline": parent_cmdline,
+        "stdin_is_tty": stdin_is_tty,
+        "has_dist_init_method": has_dist_init_method,
+        "has_torchrun_marker": has_torchrun_marker,
+        "has_master_addr": has_master_addr,
+        "has_master_port": has_master_port,
+    }
 
 
 def set_numa_affinity():
@@ -52,6 +89,15 @@ def set_numa_affinity():
 
 
 def initialize_global_process_group(timeout_second=36000):
+    should_fail_fast, fail_fast_data = _should_fail_fast_interactive_launch()
+    if should_fail_fast:
+        raise RuntimeError(
+            "Detected an interactive shell launch with WORLD_SIZE > 1. "
+            "This entrypoint expects a real distributed launcher and would otherwise hang in "
+            "torch.distributed.init_process_group(). "
+            "Use torchrun/srun to launch one Python process per rank, or override "
+            "WORLD_SIZE=1 RANK=0 LOCAL_RANK=0 for single-process smoke tests."
+        )
     torch.distributed.init_process_group(
         get_nccl_backend(),
         timeout=timedelta(seconds=timeout_second),

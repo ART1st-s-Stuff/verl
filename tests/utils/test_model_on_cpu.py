@@ -15,8 +15,9 @@
 from types import SimpleNamespace  # Or use a mock object library
 
 import pytest
+from transformers import AutoModelForCausalLM, AutoModelForVision2Seq
 
-from verl.utils.model import update_model_config
+from verl.utils.model import get_hf_auto_model_class, update_model_config
 
 
 # Parametrize with different override scenarios
@@ -50,3 +51,15 @@ def test_update_model_config(override_kwargs):
         assert mock_config.nested_params.sub_param_x == "original_x", "Nested sub_param_x should be unchanged"
         assert mock_config.nested_params.sub_param_y == 100, "Nested sub_param_y should be unchanged"
         assert not hasattr(mock_config.nested_params, "sub_param_z"), "Nested sub_param_z should not exist"
+
+
+def test_get_hf_auto_model_class_for_conditional_generation_vlm():
+    mock_config = SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"])
+
+    assert get_hf_auto_model_class(mock_config) is AutoModelForVision2Seq
+
+
+def test_get_hf_auto_model_class_for_causal_lm_architecture():
+    mock_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+
+    assert get_hf_auto_model_class(mock_config) is AutoModelForCausalLM

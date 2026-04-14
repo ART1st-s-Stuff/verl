@@ -21,6 +21,7 @@ data:
   val_files: null
   train_max_samples: -1  # set to -1 to use full dataset
   val_max_samples: -1  # set to -1 to use full dataset
+  num_workers: 8
   # Multi-turn settings
   messages_key: messages  # Key for messages list in multi-turn mode
   tools_key: tools  # Key for tools list in multi-turn mode

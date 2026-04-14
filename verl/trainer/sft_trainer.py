@@ -176,6 +176,7 @@ class SFTTrainer:
 
         dp_rank = self.engine.get_data_parallel_rank()
         dp_size = self.engine.get_data_parallel_size()
+        num_workers = config.data.get("num_workers", 8)
 
         self.train_sampler = DistributedSampler(
             self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
@@ -190,7 +191,7 @@ class SFTTrainer:
             batch_size=self.train_batch_size_per_dp,
             sampler=self.train_sampler,
             collate_fn=self.collate_fn,
-            num_workers=8,
+            num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
             pin_memory_device=device_name,
@@ -205,7 +206,7 @@ class SFTTrainer:
                 batch_size=self.train_batch_size_per_dp,
                 sampler=self.val_sampler,
                 collate_fn=self.collate_fn,
-                num_workers=8,
+                num_workers=num_workers,
                 pin_memory=True,
                 drop_last=True,
                 pin_memory_device=device_name,
@@ -374,9 +375,11 @@ def run_sft(config):
     from verl.utils.distributed import initialize_global_process_group
 
     initialize_global_process_group()
-    trainer = SFTTrainer(config=config)
-    trainer.fit()
-    destroy_global_process_group()
+    try:
+        trainer = SFTTrainer(config=config)
+        trainer.fit()
+    finally:
+        destroy_global_process_group()
 
 
 @hydra.main(config_path="config", config_name="sft_trainer_engine", version_base=None)

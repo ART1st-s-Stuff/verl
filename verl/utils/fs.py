@@ -31,6 +31,22 @@ __all__ = ["copy", "exists", "makedirs"]
 _HDFS_PREFIX = "hdfs://"
 
 
+def _normalize_localish_path(src: str) -> str:
+    if not isinstance(src, str):
+        return src
+    if is_non_local(src):
+        return src
+    if src.startswith("~") or src.startswith("/") or src.startswith("."):
+        return os.path.abspath(os.path.expanduser(os.path.expandvars(src)))
+    return src
+
+
+def _looks_like_local_path(src: str) -> bool:
+    return isinstance(src, str) and not is_non_local(src) and (
+        src.startswith("~") or src.startswith("/") or src.startswith(".")
+    )
+
+
 def is_non_local(path):
     """Check if a path is a non-local (HDFS) path.
 
@@ -208,8 +224,16 @@ def copy_to_local(
     Returns:
         str: Local filesystem path to copied resource
     """
+    normalized_src = _normalize_localish_path(src)
+
+    if _looks_like_local_path(src) and isinstance(normalized_src, str) and not os.path.exists(normalized_src):
+        raise FileNotFoundError(
+            f"Local path does not exist: {normalized_src}. "
+            f"Please point `model.path`/`tokenizer_path` to an existing local model directory."
+        )
+
     # Save to a local path for persistence.
-    local_path = copy_local_path_from_hdfs(src, cache_dir, filelock, verbose, always_recopy)
+    local_path = copy_local_path_from_hdfs(normalized_src, cache_dir, filelock, verbose, always_recopy)
 
     if use_shm and isinstance(local_path, str) and not os.path.exists(local_path):
         try:

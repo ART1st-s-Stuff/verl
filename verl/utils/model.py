@@ -681,11 +681,28 @@ def get_hf_auto_model_class(hf_config):
             case _:
                 actor_module_class = AutoModel
     else:
-        actor_module_class = AutoModel
-        for key, cls in _architecture_to_auto_class.items():
-            if key in hf_config.architectures[0]:
-                actor_module_class = cls
-                break
+        config_type = type(hf_config)
+        if config_type in AutoModelForVision2Seq._model_mapping.keys():
+            actor_module_class = AutoModelForVision2Seq
+        elif config_type in AutoModelForCausalLM._model_mapping.keys():
+            actor_module_class = AutoModelForCausalLM
+        elif config_type in AutoModelForTokenClassification._model_mapping.keys():
+            actor_module_class = AutoModelForTokenClassification
+        elif config_type in AutoModelForSequenceClassification._model_mapping.keys():
+            actor_module_class = AutoModelForSequenceClassification
+        else:
+            actor_module_class = AutoModel
+            architecture = hf_config.architectures[0] if getattr(hf_config, "architectures", None) else ""
+            for key, cls in _architecture_to_auto_class.items():
+                if key in architecture:
+                    actor_module_class = cls
+                    break
+
+            # VLM configs such as Qwen2.5-VL often expose
+            # `*ForConditionalGeneration`, which should load through the
+            # Vision2Seq auto class instead of falling back to AutoModel.
+            if actor_module_class is AutoModel and architecture.endswith("ForConditionalGeneration"):
+                actor_module_class = AutoModelForVision2Seq
 
     return actor_module_class
 

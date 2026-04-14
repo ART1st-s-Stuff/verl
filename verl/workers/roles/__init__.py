@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .actor import ActorWorker
-from .critic import CriticWorker
+from importlib import import_module
 
-try:
-    from .reward_model import RewardModelWorker
-except ImportError:
-    RewardModelWorker = None
+__all__ = ["CriticWorker", "ActorWorker", "RewardModelWorker"]
 
-__all__ = ["CriticWorker", "ActorWorker"]
 
-if RewardModelWorker is not None:
-    __all__.append("RewardModelWorker")
+def __getattr__(name):
+    if name == "ActorWorker":
+        return import_module(".actor", __name__).ActorWorker
+    if name == "CriticWorker":
+        return import_module(".critic", __name__).CriticWorker
+    if name == "RewardModelWorker":
+        try:
+            return import_module(".reward_model", __name__).RewardModelWorker
+        except ImportError:
+            return None
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

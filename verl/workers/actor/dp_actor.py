@@ -22,7 +22,6 @@ import os
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -44,9 +43,8 @@ from verl.workers.config import ActorConfig
 from verl.workers.roles.utils.action_schema import get_action_start_token_id
 from verl.workers.roles.utils.mcts_planner import MCTSPlanner, MCTSPlannerConfig
 from verl.workers.roles.utils.world_model import (
-    LatentStateEncoder,
-    TransitionRewardNet,
-    cast_tensor_to_module_dtype,
+    build_latent_predictor,
+    compute_world_model_aux_loss,
     extract_latent_z,
 )
 
@@ -117,38 +115,42 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
-        self.state_encoder = None
-        self.transition_reward_net = None
+        self.world_model_predictor = None
         self.world_model_optimizer = None
         self.mcts_planner = None
-        if self.actor_optimizer is not None and self.config.num_actions > 0 and self.config.world_state_dim > 0:
+        if self.actor_optimizer is not None and self.config.num_actions > 0:
+            if self.config.predictor_mode in {"world_state_with_decoder", "world_state_mlp"} and self.config.world_state_dim <= 0:
+                raise ValueError("world_state_dim must be > 0 for world_state predictor modes.")
             model_cfg = getattr(getattr(self.actor_module, "module", self.actor_module), "config", None)
             hidden_size = getattr(model_cfg, "hidden_size", None)
             if hidden_size is None:
                 raise ValueError("Actor model config must define hidden_size when world model is enabled.")
             transition_hidden_dim = self.config.transition_hidden_dim or hidden_size
-            self.state_encoder = LatentStateEncoder(hidden_size, self.config.world_state_dim).to(get_device_id())
-            self.transition_reward_net = TransitionRewardNet(
-                world_state_dim=self.config.world_state_dim,
+            self.world_model_predictor = build_latent_predictor(
+                predictor_mode=self.config.predictor_mode,
+                latent_dim=hidden_size,
                 num_actions=self.config.num_actions,
+                world_state_dim=self.config.world_state_dim,
                 hidden_dim=transition_hidden_dim,
+                multi_step_horizon=self.config.predictor_multi_step_horizon,
             ).to(get_device_id())
             world_model_lr = self.config.action_head_lr or self.config.optim.lr
             self.world_model_optimizer = torch.optim.AdamW(
-                list(self.state_encoder.parameters()) + list(self.transition_reward_net.parameters()),
+                list(self.world_model_predictor.parameters()),
                 lr=world_model_lr,
             )
-            self.mcts_planner = MCTSPlanner(
-                transition_model=self.transition_reward_net,
-                num_actions=self.config.num_actions,
-                config=MCTSPlannerConfig(
-                    depth=_mcts_cfg_value(self.config.mcts, "depth", 3),
-                    branching=_mcts_cfg_value(self.config.mcts, "branching", 8),
-                    c_puct=_mcts_cfg_value(self.config.mcts, "c_puct", 1.0),
-                    rollout_steps=_mcts_cfg_value(self.config.mcts, "rollout_steps", 1),
-                    discount=_mcts_cfg_value(self.config.mcts, "discount", 0.99),
-                ),
-            )
+            if hasattr(self.world_model_predictor, "transition_reward_net"):
+                self.mcts_planner = MCTSPlanner(
+                    transition_model=self.world_model_predictor.transition_reward_net,
+                    num_actions=self.config.num_actions,
+                    config=MCTSPlannerConfig(
+                        depth=_mcts_cfg_value(self.config.mcts, "depth", 3),
+                        branching=_mcts_cfg_value(self.config.mcts, "branching", 8),
+                        c_puct=_mcts_cfg_value(self.config.mcts, "c_puct", 1.0),
+                        rollout_steps=_mcts_cfg_value(self.config.mcts, "rollout_steps", 1),
+                        discount=_mcts_cfg_value(self.config.mcts, "discount", 0.99),
+                    ),
+                )
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False, extract_latent=False
@@ -482,7 +484,7 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
 
-        if self.state_encoder is not None and self.transition_reward_net is not None:
+        if self.world_model_predictor is not None:
             world_model_batch_keys = (
                 "action_labels",
                 "step_rewards",
@@ -525,7 +527,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     micro_batch_metrics["actor/world_model_enabled"] = (
-                        1.0 if (self.state_encoder is not None and self.transition_reward_net is not None) else 0.0
+                        1.0 if self.world_model_predictor is not None else 0.0
                     )
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
@@ -548,7 +550,7 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs,
                         temperature=temperature,
                         calculate_entropy=calculate_entropy,
-                        extract_latent=self.state_encoder is not None,
+                        extract_latent=self.world_model_predictor is not None,
                     )
 
                     # for fully_async_policy recipe
@@ -618,53 +620,27 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if (
-                        self.state_encoder is not None
-                        and self.transition_reward_net is not None
+                        self.world_model_predictor is not None
                         and latent is not None
                         and "action_labels" in model_inputs
                         and "step_rewards" in model_inputs
                     ):
-                        action_labels = model_inputs["action_labels"].long().reshape(-1)
-                        step_rewards = model_inputs["step_rewards"].float().reshape(-1)
-                        supervision_mask = torch.ones_like(action_labels, dtype=torch.bool)
-                        if "action_label_mask" in model_inputs:
-                            supervision_mask = supervision_mask & model_inputs["action_label_mask"].to(torch.bool).reshape(-1)
-                        if not supervision_mask.any():
-                            micro_batch_metrics["actor/world_model_supervision_missing"] = 1.0 * loss_scale_factor
-                        else:
-                            latent_input = latent.detach() if self.config.action_head_detach_latent else latent
-                            latent_input = cast_tensor_to_module_dtype(latent_input, self.state_encoder)
-                            world_state = self.state_encoder(latent_input[supervision_mask])
-                            pred_next_state, pred_reward = self.transition_reward_net(
-                                world_state, action_labels[supervision_mask]
-                            )
-                            reward_target = step_rewards[supervision_mask].reshape_as(pred_reward)
-                            reward_loss = F.mse_loss(pred_reward, reward_target)
-                            policy_loss = policy_loss + self.config.reward_loss_coef * reward_loss
-                            micro_batch_metrics["actor/reward_loss"] = reward_loss.detach().item() * loss_scale_factor
-                            world_model_loss = self.config.reward_loss_coef * reward_loss.detach()
-
-                            if "next_latent" in model_inputs:
-                                next_latent = model_inputs["next_latent"]
-                                if next_latent.dim() == 3:
-                                    next_latent = next_latent[:, -1, :]
-                                next_mask = supervision_mask.clone()
-                                if "next_latent_mask" in model_inputs:
-                                    next_mask = next_mask & model_inputs["next_latent_mask"].to(torch.bool).reshape(-1)
-                                if next_mask.any():
-                                    with torch.no_grad():
-                                        target_next_state = self.state_encoder(
-                                            cast_tensor_to_module_dtype(next_latent[next_mask], self.state_encoder)
-                                        )
-                                    pred_next_state_for_state = self.transition_reward_net(
-                                        self.state_encoder(latent_input[next_mask]), action_labels[next_mask]
-                                    )[0]
-                                    state_loss = F.mse_loss(pred_next_state_for_state, target_next_state)
-                                    policy_loss = policy_loss + self.config.state_loss_coef * state_loss
-                                    micro_batch_metrics["actor/state_loss"] = state_loss.detach().item() * loss_scale_factor
-                                    world_model_loss = world_model_loss + self.config.state_loss_coef * state_loss.detach()
-                            micro_batch_metrics["actor/world_model_loss"] = world_model_loss.item() * loss_scale_factor
-                    elif self.state_encoder is not None and self.transition_reward_net is not None:
+                        latent_input = latent.detach() if self.config.action_head_detach_latent else latent
+                        aux_loss, aux_metrics, handled = compute_world_model_aux_loss(
+                            predictor=self.world_model_predictor,
+                            latent=latent_input,
+                            action_labels=model_inputs["action_labels"],
+                            step_rewards=model_inputs["step_rewards"],
+                            config=self.config,
+                            action_label_mask=model_inputs["action_label_mask"] if "action_label_mask" in model_inputs else None,
+                            next_latent=model_inputs["next_latent"] if "next_latent" in model_inputs else None,
+                            next_latent_mask=model_inputs["next_latent_mask"] if "next_latent_mask" in model_inputs else None,
+                        )
+                        if handled and aux_loss is not None:
+                            policy_loss = policy_loss + aux_loss
+                        for key, value in aux_metrics.items():
+                            micro_batch_metrics[key] = value * loss_scale_factor
+                    elif self.world_model_predictor is not None:
                         micro_batch_metrics["actor/world_model_supervision_missing"] = 1.0 * loss_scale_factor
 
                     if self.config.use_dynamic_bsz:

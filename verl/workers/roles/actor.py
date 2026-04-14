@@ -38,10 +38,7 @@ from verl.workers.roles.utils.action_schema import ACTION_TOKENS, compute_action
 from verl.workers.roles.utils.mcts_planner import MCTSPlanner, MCTSPlannerConfig
 from verl.workers.roles.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl.workers.roles.utils.world_model import (
-    LatentStateEncoder,
-    TransitionRewardNet,
-    canonicalize_latent_z,
-    cast_tensor_to_module_dtype,
+    build_latent_predictor,
     extract_latent_z,
 )
 
@@ -52,7 +49,11 @@ device_name = get_device_name()
 
 
 def _can_enable_world_model(config: ActorConfig) -> bool:
-    return config.num_actions > 0 and config.world_state_dim > 0
+    if config.num_actions <= 0:
+        return False
+    if config.predictor_mode in {"world_state_with_decoder", "world_state_mlp"}:
+        return config.world_state_dim > 0
+    return True
 
 
 def _can_enable_latent_mcts(config: ActorConfig) -> bool:
@@ -118,41 +119,42 @@ class ActorWorker(Worker, DistProfilerExtension):
         # setup flops counter
         self.flops_counter = FlopsCounter(self.model_config.hf_config)
 
-        self.state_encoder = None
-        self.transition_reward_net = None
+        self.world_model_predictor = None
         self.world_model_optimizer = None
         self.mcts_planner = None
         if _can_enable_world_model(self.config):
             hidden_size = self.model_config.hf_config.hidden_size
             transition_hidden_dim = self.config.transition_hidden_dim or hidden_size
-            self.state_encoder = LatentStateEncoder(hidden_size, self.config.world_state_dim).to(get_device_id())
-            self.transition_reward_net = TransitionRewardNet(
-                world_state_dim=self.config.world_state_dim,
+            self.world_model_predictor = build_latent_predictor(
+                predictor_mode=self.config.predictor_mode,
+                latent_dim=hidden_size,
                 num_actions=self.config.num_actions,
+                world_state_dim=self.config.world_state_dim,
                 hidden_dim=transition_hidden_dim,
+                multi_step_horizon=self.config.predictor_multi_step_horizon,
             ).to(get_device_id())
             world_model_lr = self.config.action_head_lr or self.optimizer_config.lr
             self.world_model_optimizer = torch.optim.AdamW(
-                list(self.state_encoder.parameters()) + list(self.transition_reward_net.parameters()),
+                list(self.world_model_predictor.parameters()),
                 lr=world_model_lr,
             )
             self.loss_fn = partial(
                 ppo_loss,
                 config=self.config,
-                state_encoder=self.state_encoder,
-                transition_reward_net=self.transition_reward_net,
+                world_model_predictor=self.world_model_predictor,
             )
-            self.mcts_planner = MCTSPlanner(
-                transition_model=self.transition_reward_net,
-                num_actions=self.config.num_actions,
-                config=MCTSPlannerConfig(
-                    depth=_mcts_cfg_value(self.config.mcts, "depth", 3),
-                    branching=_mcts_cfg_value(self.config.mcts, "branching", 8),
-                    c_puct=_mcts_cfg_value(self.config.mcts, "c_puct", 1.0),
-                    rollout_steps=_mcts_cfg_value(self.config.mcts, "rollout_steps", 1),
-                    discount=_mcts_cfg_value(self.config.mcts, "discount", 0.99),
-                ),
-            )
+            if hasattr(self.world_model_predictor, "transition_reward_net"):
+                self.mcts_planner = MCTSPlanner(
+                    transition_model=self.world_model_predictor.transition_reward_net,
+                    num_actions=self.config.num_actions,
+                    config=MCTSPlannerConfig(
+                        depth=_mcts_cfg_value(self.config.mcts, "depth", 3),
+                        branching=_mcts_cfg_value(self.config.mcts, "branching", 8),
+                        c_puct=_mcts_cfg_value(self.config.mcts, "c_puct", 1.0),
+                        rollout_steps=_mcts_cfg_value(self.config.mcts, "rollout_steps", 1),
+                        discount=_mcts_cfg_value(self.config.mcts, "discount", 0.99),
+                    ),
+                )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -177,10 +179,8 @@ class ActorWorker(Worker, DistProfilerExtension):
             data.meta_info["micro_batch_size_per_gpu"] = self.config.ppo_infer_micro_batch_size_per_gpu
 
         with self.engine.eval_mode():
-            if self.state_encoder is not None:
-                self.state_encoder.eval()
-            if self.transition_reward_net is not None:
-                self.transition_reward_net.eval()
+            if self.world_model_predictor is not None:
+                self.world_model_predictor.eval()
             # TODO: make worker API to accept TensorDict as well
             data = data.to_tensordict()
             data = left_right_2_no_padding(data)
@@ -220,17 +220,17 @@ class ActorWorker(Worker, DistProfilerExtension):
                     temperature=1.0,
                 )
                 output_tensors.update(action_prior_tensors)
-                if self.state_encoder is not None:
+                if self.world_model_predictor is not None:
                     latent_input = latent.detach() if self.config.action_head_detach_latent else latent
-                    latent_input = cast_tensor_to_module_dtype(latent_input, self.state_encoder)
-                    world_state = self.state_encoder(latent_input)
-                    output_tensors["world_state"] = world_state
-                    if _can_enable_latent_mcts(self.config) and self.mcts_planner is not None:
+                    if hasattr(self.world_model_predictor, "encode_world_state"):
+                        world_state = self.world_model_predictor.encode_world_state(latent_input)
+                        output_tensors["world_state"] = world_state
+                    if _can_enable_latent_mcts(self.config) and self.mcts_planner is not None and "world_state" in output_tensors:
                         candidate_action_ids = None
                         if "action_prior_probs" in action_prior_tensors:
                             topk = min(self.config.num_actions, _mcts_cfg_value(self.config.mcts, "branching", 8))
                             candidate_action_ids = action_prior_tensors["action_prior_probs"].topk(topk, dim=-1).indices
-                        action_ids = self.mcts_planner.plan(world_state, candidate_action_ids=candidate_action_ids)
+                        action_ids = self.mcts_planner.plan(output_tensors["world_state"], candidate_action_ids=candidate_action_ids)
                         output_tensors["planned_action_ids"] = action_ids
                         if self.config.num_actions <= len(ACTION_TOKENS):
                             output_non_tensors["planned_action_tokens"] = [
@@ -250,8 +250,10 @@ class ActorWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         data.meta_info["use_fused_kernels"] = self.config.use_fused_kernels
         data.meta_info["calculate_entropy"] = self.config.entropy_coeff != 0.0
-        data.meta_info["extract_latent"] = self.state_encoder is not None
-        data.meta_info["enable_gradient_for_latent"] = self.state_encoder is not None and not self.config.action_head_detach_latent
+        data.meta_info["extract_latent"] = self.world_model_predictor is not None
+        data.meta_info["enable_gradient_for_latent"] = (
+            self.world_model_predictor is not None and not self.config.action_head_detach_latent
+        )
         if self.config.use_dynamic_bsz:
             data.meta_info["max_token_len_per_gpu"] = self.config.ppo_max_token_len_per_gpu
         else:
@@ -262,10 +264,8 @@ class ActorWorker(Worker, DistProfilerExtension):
         data = data.to(get_device_id())
         # perform forward computation
         with self.engine.train_mode():
-            if self.state_encoder is not None:
-                self.state_encoder.train()
-            if self.transition_reward_net is not None:
-                self.transition_reward_net.train()
+            if self.world_model_predictor is not None:
+                self.world_model_predictor.train()
             dataloader = data.make_iterator(
                 mini_batch_size=self.ppo_mini_batch_size_per_dp,
                 epochs=self.config.ppo_epochs,

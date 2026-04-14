@@ -127,6 +127,8 @@ class ActorConfig(BaseConfig):
     num_actions: int = 0
     world_state_dim: int = 0
     transition_hidden_dim: Optional[int] = None
+    predictor_mode: str = "world_state_mlp"
+    predictor_multi_step_horizon: int = 1
     state_loss_coef: float = 1.0
     reward_loss_coef: float = 1.0
     action_head_detach_latent: bool = False
@@ -164,6 +166,16 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        valid_predictor_modes = {
+            "world_state_mlp",
+            "world_state_with_decoder",
+            "direct_latent_mlp",
+            "lewm_latent_dynamics",
+        }
+        if self.predictor_mode not in valid_predictor_modes:
+            raise ValueError(f"Invalid predictor_mode: {self.predictor_mode}")
+        if self.predictor_multi_step_horizon <= 0:
+            raise ValueError("predictor_multi_step_horizon must be > 0")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

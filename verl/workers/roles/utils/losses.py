@@ -14,7 +14,6 @@
 
 
 import torch
-import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
@@ -23,7 +22,7 @@ from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.roles.utils.padding import no_padding_2_padding
-from verl.workers.roles.utils.world_model import cast_tensor_to_module_dtype
+from verl.workers.roles.utils.world_model import compute_world_model_aux_loss
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -55,7 +54,7 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {"loss": loss.detach().item()}
 
 
-def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None, state_encoder=None, transition_reward_net=None):
+def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None, world_model_predictor=None):
     log_prob = model_output["log_probs"]
     entropy = model_output.get("entropy", None)
 
@@ -104,7 +103,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         metrics["kl_loss"] = kl_loss.detach().item()
         metrics["kl_coef"] = config.kl_loss_coef
 
-    world_model_enabled = state_encoder is not None and transition_reward_net is not None
+    world_model_enabled = world_model_predictor is not None
     metrics["actor/world_model_enabled"] = 1.0 if world_model_enabled else 0.0
 
     # optional latent world-model loss branch
@@ -113,44 +112,19 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None,
         latent_last = latent.values()[latent.offsets()[1:] - 1]
         if config.action_head_detach_latent:
             latent_last = latent_last.detach()
-        action_labels = data["action_labels"].long().reshape(-1)
-        step_rewards = data["step_rewards"].float().reshape(-1)
-        supervision_mask = torch.ones_like(action_labels, dtype=torch.bool)
-        if "action_label_mask" in data:
-            supervision_mask = supervision_mask & data["action_label_mask"].to(torch.bool).reshape(-1)
-        if not supervision_mask.any():
-            metrics["actor/world_model_supervision_missing"] = 1.0
-            return policy_loss, metrics
-
-        latent_last = cast_tensor_to_module_dtype(latent_last, state_encoder)
-        world_state = state_encoder(latent_last[supervision_mask])
-        pred_next_state, pred_reward = transition_reward_net(world_state, action_labels[supervision_mask])
-
-        reward_target = step_rewards[supervision_mask].reshape_as(pred_reward)
-        reward_loss = F.mse_loss(pred_reward, reward_target)
-        policy_loss = policy_loss + config.reward_loss_coef * reward_loss
-        metrics["actor/reward_loss"] = reward_loss.detach().item()
-        metrics["actor/world_model_loss"] = (config.reward_loss_coef * reward_loss.detach()).item()
-
-        if "next_latent" in data:
-            next_latent = data["next_latent"]
-            if next_latent.dim() == 3:
-                next_latent = next_latent[:, -1, :]
-            next_mask = supervision_mask.clone()
-            if "next_latent_mask" in data:
-                next_mask = next_mask & data["next_latent_mask"].to(torch.bool).reshape(-1)
-            if next_mask.any():
-                with torch.no_grad():
-                    target_next_state = state_encoder(
-                        cast_tensor_to_module_dtype(next_latent[next_mask], state_encoder)
-                    )
-                pred_next_state_for_state = transition_reward_net(
-                    state_encoder(latent_last[next_mask]), action_labels[next_mask]
-                )[0]
-                state_loss = F.mse_loss(pred_next_state_for_state, target_next_state)
-                policy_loss = policy_loss + config.state_loss_coef * state_loss
-                metrics["actor/state_loss"] = state_loss.detach().item()
-                metrics["actor/world_model_loss"] += (config.state_loss_coef * state_loss.detach()).item()
+        aux_loss, aux_metrics, handled = compute_world_model_aux_loss(
+            predictor=world_model_predictor,
+            latent=latent_last,
+            action_labels=data["action_labels"],
+            step_rewards=data["step_rewards"],
+            config=config,
+            action_label_mask=data["action_label_mask"] if "action_label_mask" in data else None,
+            next_latent=data["next_latent"] if "next_latent" in data else None,
+            next_latent_mask=data["next_latent_mask"] if "next_latent_mask" in data else None,
+        )
+        if handled and aux_loss is not None:
+            policy_loss = policy_loss + aux_loss
+        metrics.update(aux_metrics)
     elif world_model_enabled:
         metrics["actor/world_model_supervision_missing"] = 1.0
 

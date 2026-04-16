@@ -212,7 +212,12 @@ class BaseModelMerger(ABC):
     def save_hf_model_and_tokenizer(self, state_dict: dict[str, torch.Tensor]):
         auto_model_class = self.get_transformers_auto_model_class()
         with init_empty_weights():
-            model = auto_model_class.from_config(self.model_config, torch_dtype=torch.bfloat16)
+            # Compatibility: some transformers versions (e.g. AutoModelForVision2Seq)
+            # do not accept torch_dtype in from_config().
+            try:
+                model = auto_model_class.from_config(self.model_config, torch_dtype=torch.bfloat16)
+            except TypeError:
+                model = auto_model_class.from_config(self.model_config)
         model.to_empty(device="cpu")
         model = self.patch_model_generation_config(model)
 

@@ -177,6 +177,8 @@ class SFTTrainer:
         dp_rank = self.engine.get_data_parallel_rank()
         dp_size = self.engine.get_data_parallel_size()
         num_workers = config.data.get("num_workers", 8)
+        pin_memory = bool(config.data.get("pin_memory", True))
+        pin_memory_device = device_name if pin_memory else ""
 
         self.train_sampler = DistributedSampler(
             self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
@@ -192,9 +194,9 @@ class SFTTrainer:
             sampler=self.train_sampler,
             collate_fn=self.collate_fn,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory,
             drop_last=True,
-            pin_memory_device=device_name,
+            pin_memory_device=pin_memory_device,
         )
 
         if self.val_dataset:
@@ -207,9 +209,9 @@ class SFTTrainer:
                 sampler=self.val_sampler,
                 collate_fn=self.collate_fn,
                 num_workers=num_workers,
-                pin_memory=True,
+                pin_memory=pin_memory,
                 drop_last=True,
-                pin_memory_device=device_name,
+                pin_memory_device=pin_memory_device,
             )
         else:
             self.val_dataloader = None

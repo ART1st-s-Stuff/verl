@@ -735,7 +735,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
 
-        if position_ids.dim() == 3:  # qwen2vl mrope
+        if position_ids.dim() == 3 and not position_ids.is_nested:  # qwen2vl mrope
             position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
         # args used to get outputs
@@ -744,7 +744,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if use_remove_padding:
             if pad_mode == DatasetPadMode.NO_PADDING:
                 input_ids_rmpad = input_ids.values().unsqueeze(0)  # (1, total_nnz)
-                position_ids_rmpad = position_ids.values().unsqueeze(0)  # (1, total_nnz)
+                if position_ids.is_nested and position_ids.dim() == 3:
+                    # For VLM mRoPE, each sample position_ids is (4, seq_len_i).
+                    # Flatten along sequence while keeping the mRoPE channels.
+                    position_ids_list = list(position_ids)
+                    if position_ids_list:
+                        position_ids_rmpad = torch.cat(position_ids_list, dim=-1).unsqueeze(1)  # (4, 1, total_nnz)
+                    else:
+                        position_ids_rmpad = torch.zeros(
+                            (4, 1, 0), dtype=position_ids.values().dtype, device=position_ids.values().device
+                        )
+                else:
+                    position_ids_rmpad = position_ids.values().unsqueeze(0)  # (1, total_nnz)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -804,9 +815,27 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len)
                 )
 
-                position_ids = torch.nested.to_padded_tensor(
-                    position_ids, padding=0, output_size=(batch_size, max_seq_len)
-                )
+                if position_ids.dim() == 3:
+                    # Avoid torch.nested.to_padded_tensor for mRoPE position ids because
+                    # some torch versions raise NestedIntNode.guard_int errors.
+                    # Expected per-sample layout: (4, seq_len_i).
+                    seq_len_dense = int(input_ids.shape[1])
+                    position_ids_list = list(position_ids)
+                    rope_dim = int(position_ids_list[0].shape[0]) if position_ids_list else 4
+                    padded_position_ids = torch.zeros(
+                        (batch_size, rope_dim, seq_len_dense),
+                        dtype=position_ids.values().dtype,
+                        device=position_ids.values().device,
+                    )
+                    for i, pid in enumerate(position_ids_list):
+                        cur_len = min(int(pid.shape[-1]), seq_len_dense)
+                        if cur_len > 0:
+                            padded_position_ids[i, :, :cur_len] = pid[:, :cur_len]
+                    position_ids = padded_position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+                else:
+                    position_ids = torch.nested.to_padded_tensor(
+                        position_ids, padding=0, output_size=(batch_size, max_seq_len)
+                    )
 
                 attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
                 attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)

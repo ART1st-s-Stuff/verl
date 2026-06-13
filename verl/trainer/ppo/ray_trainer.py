@@ -526,6 +526,13 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _maybe_extract_latent_action(self, batch: DataProto) -> DataProto:
+        if not self.config.actor_rollout_ref.rollout.get("extract_latent_action", False):
+            return batch
+        if "action_prior_logits" in batch.batch.keys():
+            return batch
+        return self.actor_rollout_wg.extract_latent_action(batch)
+
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -592,6 +599,7 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_output_gen_batch = self._maybe_extract_latent_action(test_output_gen_batch)
 
             print("validation generation end")
 
@@ -1043,6 +1051,7 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        gen_batch_output = self._maybe_extract_latent_action(gen_batch_output)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:

@@ -88,6 +88,7 @@ from verl.utils.ray_utils import get_event_loop
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.rollout import get_rollout_class
+from verl.workers.rollout.latent_action import extract_latent_action_from_model, get_latent_action_token_ids
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 logger = logging.getLogger(__file__)
@@ -933,6 +934,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             loop.run_until_complete(self.trainer_mode())
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
+        if self.config.rollout.get("extract_latent_action", False):
+            output = self._extract_latent_action_from_sequences(output)
+
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
         timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
@@ -952,6 +956,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # clear kv cache
         get_torch_device().empty_cache()
         return output
+
+    def _extract_latent_action_from_sequences(self, output: DataProto) -> DataProto:
+        if not self._is_actor:
+            raise RuntimeError("rollout.extract_latent_action requires an actor model in the worker.")
+        if "multi_modal_inputs" in output.non_tensor_batch:
+            raise NotImplementedError("rollout.extract_latent_action for multimodal FSDP rollouts is not implemented yet.")
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        token_ids = get_latent_action_token_ids(self.tokenizer)
+        batch = output.batch
+        with self.ulysses_sharding_manager:
+            tensors = extract_latent_action_from_model(
+                model=self.actor.actor_module,
+                input_ids=batch["input_ids"].to(get_device_id()),
+                attention_mask=batch["attention_mask"].to(get_device_id()),
+                position_ids=batch["position_ids"].to(get_device_id()),
+                token_ids=token_ids,
+            )
+
+        output = output.union(DataProto.from_dict(tensors={key: value.to("cpu") for key, value in tensors.items()}))
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during latent action extraction", logger=logger)
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="actor_extract_latent_action")
+    def extract_latent_action(self, data: DataProto):
+        assert self._is_actor
+        data = data.to(get_device_id())
+        return self._extract_latent_action_from_sequences(data).to("cpu")
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")

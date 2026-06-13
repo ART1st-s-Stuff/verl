@@ -165,6 +165,8 @@ class RolloutConfig(BaseConfig):
 
     calculate_log_probs: bool = False
 
+    extract_latent_action: bool = False
+
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
     trace: TraceConfig = field(default_factory=TraceConfig)

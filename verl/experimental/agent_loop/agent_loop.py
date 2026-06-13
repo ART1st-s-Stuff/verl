@@ -356,10 +356,17 @@ class AgentLoopWorkerBase:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
-        tasks = []
-        for i in range(len(batch)):
+        max_concurrent = config.agent.get("max_concurrent_trajectories", None)
+        semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent and max_concurrent > 0 else None
+
+        async def run_one(i: int) -> _InternalAgentLoopOutput:
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-            tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
+            if semaphore is None:
+                return await self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)
+            async with semaphore:
+                return await self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)
+
+        tasks = [asyncio.create_task(run_one(i)) for i in range(len(batch))]
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)

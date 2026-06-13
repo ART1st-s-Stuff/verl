@@ -100,6 +100,11 @@ class SGLangHttpServer:
         if self.node_rank == 0:
             self._master_address = self._server_address
             self._master_port, self._master_sock = get_free_port(self._server_address)
+            # The SGLang engine/PyTorch TCPStore binds dist_init_addr itself.
+            # Holding this probing socket open can cause EADDRINUSE when TCPStore
+            # tries to listen on the selected port, especially with many replicas.
+            self._master_sock.close()
+            self._master_sock = None
             logger.info(
                 f"SGLangHttpServer, replica_rank: {self.replica_rank}, "
                 f"master address: {self._master_address}, port: {self._master_port}"

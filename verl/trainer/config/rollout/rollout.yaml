@@ -205,6 +205,10 @@ agent:
   # Number of agent loop workers
   num_workers: 8
 
+  # Maximum concurrent trajectories launched inside each agent loop worker.
+  # null preserves the original behavior of launching the full worker chunk.
+  max_concurrent_trajectories: null
+
   # default agent loop to use if `agent_name` not set in RL dataset
   default_agent_loop: single_turn_agent
 

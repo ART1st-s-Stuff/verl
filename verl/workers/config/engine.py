@@ -112,6 +112,7 @@ class FSDPEngineConfig(BaseConfig):
     forward_prefetch: bool = False
     model_dtype: str = "fp32"
     use_orig_params: bool = False
+    sync_module_states: bool = True
     mixed_precision: Optional[dict[str, Any]] = None
     ulysses_sequence_parallel_size: int = 1
     entropy_from_logits_with_chunking: bool = False

@@ -16,6 +16,8 @@ import asyncio
 import dataclasses
 import logging
 import os
+import socket
+from contextlib import closing
 from typing import Any, Optional
 
 import ray
@@ -45,6 +47,40 @@ from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _is_port_available(address: str, port: int) -> bool:
+    family = socket.AF_INET6 if is_valid_ipv6_address(address) else socket.AF_INET
+    with closing(socket.socket(family=family, type=socket.SOCK_STREAM)) as probe:
+        probe.settimeout(0.2)
+        if probe.connect_ex((address, port)) == 0:
+            return False
+    with closing(socket.socket(family=family, type=socket.SOCK_STREAM)) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((address, port))
+        except OSError:
+            return False
+    return True
+
+
+def _select_sglang_master_port(address: str, replica_rank: int, node_rank: int) -> int:
+    base_port = int(os.environ.get("VERL_SGLANG_MASTER_PORT_BASE", "50000"))
+    stride = int(os.environ.get("VERL_SGLANG_MASTER_PORT_STRIDE", "256"))
+    job_offset = int(os.environ.get("SLURM_JOB_ID", "0")) % 997
+    preferred_port = base_port + job_offset + replica_rank * stride + node_rank
+    for offset in range(stride):
+        port = preferred_port + offset
+        if port <= 65535 and _is_port_available(address, port):
+            return port
+
+    for _ in range(1024):
+        port, sock = get_free_port(address)
+        sock.close()
+        if _is_port_available(address, port):
+            return port
+
+    raise RuntimeError(f"failed to find an available SGLang master port on {address}")
 
 
 @ray.remote(num_cpus=1)
@@ -99,12 +135,7 @@ class SGLangHttpServer:
         # used for NCCL process group
         if self.node_rank == 0:
             self._master_address = self._server_address
-            self._master_port, self._master_sock = get_free_port(self._server_address)
-            # The SGLang engine/PyTorch TCPStore binds dist_init_addr itself.
-            # Holding this probing socket open can cause EADDRINUSE when TCPStore
-            # tries to listen on the selected port, especially with many replicas.
-            self._master_sock.close()
-            self._master_sock = None
+            self._master_port = _select_sglang_master_port(self._server_address, self.replica_rank, self.node_rank)
             logger.info(
                 f"SGLangHttpServer, replica_rank: {self.replica_rank}, "
                 f"master address: {self._master_address}, port: {self._master_port}"

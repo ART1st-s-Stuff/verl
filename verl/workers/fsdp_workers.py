@@ -501,7 +501,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
                 mixed_precision=mixed_precision,
-                sync_module_states=True,
+                sync_module_states=fsdp_config.get("sync_module_states", True),
                 device_mesh=self.device_mesh,
                 use_orig_params=self.use_orig_params,
                 forward_prefetch=fsdp_config.get("forward_prefetch", False),
@@ -535,6 +535,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if enable_activation_offload:
             enable_activation_offloading(actor_module_fsdp, fsdp_strategy, enable_gradient_checkpointing)
 
+        print(f"[NIMLOTH_DEBUG rank={self.rank}] After {role} FSDP init", flush=True)
         log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
 
         # TODO: add more optimizer args into config
@@ -570,6 +571,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
 
+            print(f"[NIMLOTH_DEBUG rank={self.rank}] After {role} optimizer init", flush=True)
             log_gpu_memory_usage(f"After {role} optimizer init", logger=logger)
         else:
             actor_optimizer = None
@@ -596,6 +598,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         rollout_device_mesh = init_device_mesh(
             device_name, mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
         )
+        print(
+            f"[NIMLOTH_DEBUG rank={self.rank}] After rollout init_device_mesh dp={dp} infer_tp={infer_tp} infer_pp={infer_pp}",
+            flush=True,
+        )
         rollout_name = self.config.rollout.name
 
         if rollout_name == "hf":
@@ -618,9 +624,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-        )
+        print(f"[NIMLOTH_DEBUG rank={self.rank}] Before rollout class resolve name={rollout_name} mode={rollout_config.mode}", flush=True)
+        rollout_cls = get_rollout_class(rollout_config.name, rollout_config.mode)
+        print(f"[NIMLOTH_DEBUG rank={self.rank}] After rollout class resolve cls={rollout_cls.__module__}.{rollout_cls.__name__}", flush=True)
+        print(f"[NIMLOTH_DEBUG rank={self.rank}] Before rollout class init name={rollout_name}", flush=True)
+        self.rollout = rollout_cls(config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh)
+        print(f"[NIMLOTH_DEBUG rank={self.rank}] After rollout class init name={rollout_name}", flush=True)
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
@@ -631,11 +640,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 state_dict_config=FullStateDictConfig(),
             )
         elif fsdp_version(self.actor_module_fsdp) == 1:
+            print(f"[NIMLOTH_DEBUG rank={self.rank}] Before FSDP.set_state_dict_type SHARDED", flush=True)
             FSDP.set_state_dict_type(
                 self.actor_module_fsdp,
                 state_dict_type=StateDictType.SHARDED_STATE_DICT,
                 state_dict_config=ShardedStateDictConfig(),
             )
+            print(f"[NIMLOTH_DEBUG rank={self.rank}] After FSDP.set_state_dict_type SHARDED", flush=True)
 
         # used for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
@@ -796,11 +807,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
             if self._is_offload_param:
+                print(f"[NIMLOTH_DEBUG rank={self.rank}] Before offload actor model during init", flush=True)
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                print(f"[NIMLOTH_DEBUG rank={self.rank}] After offload actor model during init", flush=True)
                 log_gpu_memory_usage("After offload actor model during init", logger=logger)
 
             if self._is_offload_optimizer:
+                print(f"[NIMLOTH_DEBUG rank={self.rank}] Before offload actor optimizer during init", flush=True)
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                print(f"[NIMLOTH_DEBUG rank={self.rank}] After offload actor optimizer during init", flush=True)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
 
         if self._is_actor:
@@ -810,7 +825,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
         if self._is_rollout:
+            print(f"[NIMLOTH_DEBUG rank={self.rank}] Before build_rollout", flush=True)
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            print(f"[NIMLOTH_DEBUG rank={self.rank}] After build_rollout", flush=True)
 
         if self._is_ref:
             ref_model_path = self.config.model.path

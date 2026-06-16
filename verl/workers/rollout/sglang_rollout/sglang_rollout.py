@@ -25,17 +25,25 @@ from typing import Any, Generator, Optional
 from uuid import uuid4
 
 import numpy as np
+print("[NIMLOTH_DEBUG import] imported numpy", flush=True)
 import ray
+print("[NIMLOTH_DEBUG import] imported ray", flush=True)
 import sglang.srt.entrypoints.engine
+print("[NIMLOTH_DEBUG import] imported sglang.srt.entrypoints.engine", flush=True)
 import torch
+print("[NIMLOTH_DEBUG import] imported torch", flush=True)
 import torch.distributed as dist
+print("[NIMLOTH_DEBUG import] imported torch.distributed", flush=True)
 from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+print("[NIMLOTH_DEBUG import] imported sglang.srt.managers.io_struct", flush=True)
 from sglang.srt.sampling.sampling_params import SamplingParams
+print("[NIMLOTH_DEBUG import] imported SamplingParams", flush=True)
 from sglang.srt.server_args import ServerArgs
+print("[NIMLOTH_DEBUG import] imported ServerArgs", flush=True)
 from sglang.srt.utils import (
     assert_pkg_version,
     get_open_port,
@@ -43,26 +51,46 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+print("[NIMLOTH_DEBUG import] imported sglang.srt.utils helpers", flush=True)
 from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
+print("[NIMLOTH_DEBUG import] imported sglang weight_sync", flush=True)
 from tensordict import TensorDict
+print("[NIMLOTH_DEBUG import] imported tensordict", flush=True)
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+print("[NIMLOTH_DEBUG import] imported device_mesh", flush=True)
 from torch.nn.utils.rnn import pad_sequence
+print("[NIMLOTH_DEBUG import] imported pad_sequence", flush=True)
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast, ProcessorMixin
+print("[NIMLOTH_DEBUG import] imported transformers tokenizer classes", flush=True)
 
 from verl import DataProto
+print("[NIMLOTH_DEBUG import] imported verl.DataProto", flush=True)
 from verl.interactions.base import BaseInteraction
+print("[NIMLOTH_DEBUG import] imported BaseInteraction", flush=True)
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
+print("[NIMLOTH_DEBUG import] imported interaction_registry", flush=True)
 from verl.third_party.sglang import parallel_state as sglang_ps
+print("[NIMLOTH_DEBUG import] imported verl.third_party.sglang.parallel_state", flush=True)
 from verl.tools.base_tool import BaseTool
+print("[NIMLOTH_DEBUG import] imported BaseTool", flush=True)
 from verl.tools.schemas import OpenAIFunctionCallSchema, OpenAIFunctionParsedSchema, OpenAIFunctionToolCall
+print("[NIMLOTH_DEBUG import] imported tool schemas", flush=True)
 from verl.tools.utils.tool_registry import initialize_tools_from_config
+print("[NIMLOTH_DEBUG import] imported tool_registry", flush=True)
 from verl.utils.device import get_visible_devices_keyword
+print("[NIMLOTH_DEBUG import] imported get_visible_devices_keyword", flush=True)
 from verl.utils.import_utils import deprecated
+print("[NIMLOTH_DEBUG import] imported deprecated", flush=True)
 from verl.utils.net_utils import is_ipv6
+print("[NIMLOTH_DEBUG import] imported is_ipv6", flush=True)
 from verl.utils.profiler import GPUMemoryLogger
+print("[NIMLOTH_DEBUG import] imported GPUMemoryLogger", flush=True)
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
+print("[NIMLOTH_DEBUG import] imported torch_functional helpers", flush=True)
 from verl.workers.config import HFModelConfig, RolloutConfig
+print("[NIMLOTH_DEBUG import] imported worker configs", flush=True)
 from verl.workers.rollout.base import BaseRollout
+print("[NIMLOTH_DEBUG import] imported BaseRollout", flush=True)
 from verl.workers.rollout.schemas import (
     AsyncRolloutRequest,
     AsyncRolloutRequestStateEnum,
@@ -1541,6 +1569,8 @@ class SGLangRollout(BaseRollout):
             await self._engine.flush_cache()
 
 
+print("[NIMLOTH_DEBUG module] importing sglang_rollout.py reached ServerAdapter definition", flush=True)
+
 class ServerAdapter(BaseRollout):
     """SGLang server adapter used in native http server mode, serve as http client to request SGLang server
     to resume/release/update weights and kv_cache.
@@ -1555,16 +1585,26 @@ class ServerAdapter(BaseRollout):
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
     ):
+        print("[NIMLOTH_DEBUG ServerAdapter] enter __init__", flush=True)
         super().__init__(config, model_config, device_mesh)
+        print("[NIMLOTH_DEBUG ServerAdapter] after BaseRollout.__init__", flush=True)
         self._engine: AsyncHttpServerAdapter = None
 
         rank = int(os.environ["RANK"])
         local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
         rollout_world_size = self.config.tensor_model_parallel_size * self.config.data_parallel_size
+        print(
+            f"[NIMLOTH_DEBUG ServerAdapter] env rank={rank} local_world_size={local_world_size} rollout_world_size={rollout_world_size}",
+            flush=True,
+        )
         self.replica_rank = rank // rollout_world_size
         self.rollout_rank = rank % rollout_world_size
         self.node_rank = self.rollout_rank // local_world_size
         self.local_rank = self.rollout_rank % local_world_size
+        print(
+            f"[NIMLOTH_DEBUG ServerAdapter] computed replica_rank={self.replica_rank} rollout_rank={self.rollout_rank} node_rank={self.node_rank} local_rank={self.local_rank}",
+            flush=True,
+        )
 
     async def _init_server_adapter(self):
         if self._engine is not None:

@@ -9,16 +9,7 @@ from torch import Tensor
 
 DEFAULT_LATENT_STATE_TOKEN = "<|latent_state|>"
 DEFAULT_ACTION_START_TOKEN = "<|action_start|>"
-DEFAULT_ACTION_TOKENS = (
-    "<|act_moveahead|>",
-    "<|act_moveback|>",
-    "<|act_moveright|>",
-    "<|act_moveleft|>",
-    "<|act_rotateright|>",
-    "<|act_rotateleft|>",
-    "<|act_lookup|>",
-    "<|act_lookdown|>",
-)
+DEFAULT_ACTION_TOKENS = tuple(f"<|action_({idx})|>" for idx in range(8))
 
 
 @dataclass(frozen=True)

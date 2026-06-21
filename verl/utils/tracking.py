@@ -24,6 +24,43 @@ from pathlib import Path
 from typing import Any
 
 
+
+def _scalar_for_log(v):
+    if hasattr(v, "item"):
+        return v.item()
+    if isinstance(v, (int, float, bool)):
+        return v
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return v
+
+
+def _prepare_wandb_metrics(data: dict) -> dict:
+    """Flatten navigation val metrics for wandb charts (/@ breaks UI grouping)."""
+    out = {}
+    success_vals = []
+    for key, val in data.items():
+        v = _scalar_for_log(val)
+        out[key] = v
+        if not isinstance(v, (int, float)):
+            continue
+        if "traj_success/mean@1" in key and key.startswith("val-"):
+            parts = key.split("/")
+            if len(parts) >= 2:
+                ds = parts[1]
+                alias = f"val/traj_success/{ds}"
+                out[alias] = v
+                success_vals.append(v)
+        if key.startswith("val-core/") and "reward/mean@1" in key:
+            parts = key.split("/")
+            if len(parts) >= 2:
+                out[f"val/reward/{parts[1]}"] = v
+    if success_vals:
+        out["val/traj_success/mean"] = sum(success_vals) / len(success_vals)
+    return out
+
+
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
 
@@ -153,7 +190,8 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                payload = _prepare_wandb_metrics(data) if default_backend == "wandb" else data
+                logger_instance.log(data=payload, step=step)
 
     def __del__(self):
         if "wandb" in self.logger:

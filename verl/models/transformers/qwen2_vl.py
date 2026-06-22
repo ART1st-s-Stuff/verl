@@ -261,11 +261,11 @@ def ulysses_flash_attn_forward(
     key_states = key_states.transpose(1, 2)
     value_states = value_states.transpose(1, 2)
 
-    if (self.config.use_sliding_window and getattr(self.config, "sliding_window", None) is not None and
-            self.layer_idx >= self.config.max_window_layers):
+    if (getattr(self.config, "use_sliding_window", False) and getattr(self.config, "sliding_window", None) is not None and
+            self.layer_idx >= getattr(self.config, "max_window_layers", 0)):
         sliding_window = self.config.sliding_window
     else:
-        sliding_window = None
+        sliding_window = getattr(self, "sliding_window", None)
 
     attn_output = flash_attention_forward(
         query_states,
@@ -276,7 +276,7 @@ def ulysses_flash_attn_forward(
         dropout=dropout_rate,
         sliding_window=sliding_window,
         is_causal=self.is_causal,
-        use_top_left_mask=self._flash_attn_uses_top_left_mask,
+        use_top_left_mask=getattr(self, "_flash_attn_uses_top_left_mask", False),
         position_ids=position_ids,  # important: pass position ids
     )  # (batch_size, seq_length, num_head / sp_size, head_size)
     if ulysses_sp_size > 1:

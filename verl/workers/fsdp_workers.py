@@ -37,6 +37,7 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
+from verl.workers.rollout.latent_action import extract_latent_action_from_model, get_latent_action_token_ids
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 from codetiming import Timer
@@ -494,12 +495,49 @@ class ActorRolloutRefWorker(Worker):
 
             output = self.rollout_sharding_manager.postprocess_data(output)
 
+        if self.config.rollout.get('extract_latent_action', False):
+            output = self._extract_latent_action_from_sequences(output)
+
         output = output.to('cpu')
 
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
+
+    def _extract_latent_action_from_sequences(self, output: DataProto) -> DataProto:
+        if not self._is_actor:
+            raise RuntimeError('rollout.extract_latent_action requires an actor model in the worker.')
+        if 'multi_modal_inputs' in output.non_tensor_batch:
+            raise NotImplementedError('rollout.extract_latent_action for multimodal FSDP rollouts is not implemented yet.')
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        token_ids = get_latent_action_token_ids(self.tokenizer)
+        batch = output.batch
+        with self.ulysses_sharding_manager:
+            tensors = extract_latent_action_from_model(
+                model=self.actor.actor_module,
+                input_ids=batch['input_ids'].to(torch.cuda.current_device()),
+                attention_mask=batch['attention_mask'].to(torch.cuda.current_device()),
+                position_ids=batch['position_ids'].to(torch.cuda.current_device()),
+                token_ids=token_ids,
+            )
+
+        output = output.union(DataProto.from_dict(tensors={key: value.to('cpu') for key, value in tensors.items()}))
+
+        if self.world_size > 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage('After offload actor model during latent action extraction', logger=logger)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def extract_latent_action(self, data: DataProto):
+        assert self._is_actor
+        data = data.to(torch.cuda.current_device())
+        return self._extract_latent_action_from_sequences(data).to('cpu')
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):

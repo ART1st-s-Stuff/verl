@@ -96,10 +96,10 @@ class vLLMRollout(BaseRollout):
             vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size,
                                               num_tp_per_train_tp=num_tp_per_train_tp)
 
-        assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
+        max_model_len = config.get('max_trajectory_length', config.prompt_length + config.response_length)
+        assert model_hf_config.max_position_embeddings >= max_model_len, \
             "model context length should be greater than total sequence length"
 
-        max_model_len=config.get("max_trajectory_length",config.prompt_length + config.response_length)
         # print(f"[DEBUG] max_trajectory_length: {config.max_trajectory_length}")
         # if model is qwenvl
         if "Qwen2.5-VL" in model_path:
@@ -146,7 +146,7 @@ class vLLMRollout(BaseRollout):
         kwargs = dict(
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
-            max_tokens=config.response_length,
+            max_tokens=config.get('max_response_per_turn', None) or config.response_length,
         )
 
         # # we may detokenize the result all together later
@@ -214,6 +214,9 @@ class vLLMRollout(BaseRollout):
             } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
 
         do_sample = prompts.meta_info.get('do_sample', True)
+        max_response_per_turn = self.config.get('max_response_per_turn', None)
+        if max_response_per_turn is not None:
+            kwargs['max_tokens'] = max_response_per_turn
         if not do_sample:
             kwargs = {
                 'best_of': 1,
@@ -221,7 +224,8 @@ class vLLMRollout(BaseRollout):
                 'top_k': -1,
                 'min_p': 0.0,
                 'temperature': 0,
-                'n': 1  # if greedy, only 1 response
+                'n': 1,  # if greedy, only 1 response
+                'max_tokens': max_response_per_turn or self.config.response_length,
             }
 
         # users can customize different sampling_params at different run
@@ -247,7 +251,7 @@ class vLLMRollout(BaseRollout):
         # for i in range(len(response)):
         #     print(f"[DEBUG] response {i} length: {len(response[i])}")
         response = pad_2d_list_to_length(response, self.pad_token_id,
-                                         max_length=self.config.response_length).to(idx.device)
+                                         max_length=max_response_per_turn or self.config.response_length).to(idx.device)
 
         if self.config.n > 1 and do_sample:
             idx = _repeat_interleave(idx, self.config.n)

@@ -91,9 +91,9 @@ actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
-    limit_mm_per_prompt: 5 # for image limits in vllm rollout (default to 1, now we increase it to 5)
+    limit_mm_per_prompt: 20 # for image limits in vllm rollout (default to 1; navigation can carry up to 20 step images)
     # Optional per-turn generation cap for agentic rollout; defaults to response_length when null.
-    max_response_per_turn: null
+    max_response_per_turn: 2048
     # Extract Nimloth latent/action tensors after rollout generation.
     # Adds latent_state_attention_embeddings, latent_state_positions, latent_state_mask,
     # action_prior_logits, action_prior_positions, action_prior_mask.

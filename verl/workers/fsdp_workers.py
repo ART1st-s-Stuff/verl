@@ -728,7 +728,7 @@ class CriticWorker(Worker):
             warnings.simplefilter("ignore")
             setattr(critic_model_config, 'classifier_dropout', 0.)
             setattr(critic_model_config, 'hidden_dropout', '0')
-            if "Qwen2.5-VL" in local_path:
+            if critic_model_config.model_type == "qwen2_5_vl" or "Qwen2.5-VL" in local_path:
                 from verl.models.transformers.modeling_qwen_2_5_vl_patch import Qwen2_5_VLForTokenClassification
                 critic_module = Qwen2_5_VLForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,

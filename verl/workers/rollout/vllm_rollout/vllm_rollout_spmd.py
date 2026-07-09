@@ -102,7 +102,7 @@ class vLLMRollout(BaseRollout):
 
         # print(f"[DEBUG] max_trajectory_length: {config.max_trajectory_length}")
         # if model is qwenvl
-        if "Qwen2.5-VL" in model_path:
+        if getattr(model_hf_config, 'model_type', None) == 'qwen2_5_vl' or "Qwen2.5-VL" in model_path:
             self.inference_engine = LLM(
                 model=model_path,
                 enable_sleep_mode=True,

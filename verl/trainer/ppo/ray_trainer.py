@@ -855,9 +855,19 @@ class RayPPOTrainer(object):
         # load dataloader,
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+        restore_dataloader_state = self.config.trainer.get('restore_dataloader_state', True)
+        if not restore_dataloader_state:
+            print(f"Skipping dataloader state restore from {dataloader_local_path} because trainer.restore_dataloader_state=False")
+        elif os.path.exists(dataloader_local_path):
+            try:
+                dataloader_state_dict = torch.load(dataloader_local_path)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
+            except StopIteration as e:
+                raise RuntimeError(
+                    f"Failed to restore dataloader state from {dataloader_local_path}. "
+                    "If this run is meant to restart training from an existing checkpoint with fresh data order, "
+                    "rerun with trainer.restore_dataloader_state=False."
+                ) from e
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 

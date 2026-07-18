@@ -682,13 +682,17 @@ class ActorRolloutRefWorker(Worker):
         if self.wm_auxiliary_module is not None:
             wm_path = os.path.join(local_path, 'nimloth_wm_aux.pt')
             if self.rank == 0:
+                wm_config = OmegaConf.to_container(
+                    self.config.actor.nimloth_wm_aux, resolve=True
+                )
                 torch.save({
+                    'schema_version': 1,
+                    'latent_query_mode': wm_config['latent_query_mode'],
+                    'latent_token_count': int(wm_config['latent_token_count']),
                     'module': self.wm_auxiliary_module.module.state_dict(),
                     'optimizer': self.wm_optimizer.state_dict(),
                     'lr_scheduler': self.wm_lr_scheduler.state_dict(),
-                    'config': OmegaConf.to_container(
-                        self.config.actor.nimloth_wm_aux, resolve=True
-                    ),
+                    'config': wm_config,
                     'global_step': int(global_step),
                 }, wm_path)
             torch.distributed.barrier()
@@ -714,6 +718,12 @@ class ActorRolloutRefWorker(Worker):
             expected_config = OmegaConf.to_container(
                 self.config.actor.nimloth_wm_aux, resolve=True
             )
+            if state.get('schema_version') != 1:
+                raise ValueError('Nimloth WM auxiliary checkpoint schema mismatch')
+            if state.get('latent_query_mode') != 'inject':
+                raise ValueError('Nimloth WM auxiliary checkpoint query-mode mismatch')
+            if state.get('latent_token_count') != int(expected_config['latent_token_count']):
+                raise ValueError('Nimloth WM auxiliary checkpoint latent-count mismatch')
             if state.get('config') != expected_config:
                 raise ValueError('Nimloth WM auxiliary checkpoint config mismatch')
             self.wm_auxiliary_module.module.load_state_dict(state['module'], strict=True)

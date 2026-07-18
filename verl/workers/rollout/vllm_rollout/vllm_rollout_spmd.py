@@ -244,6 +244,7 @@ class vLLMRollout(BaseRollout):
                 response.append(output.outputs[sample_id].token_ids)
 
         response_lens = [len(r) for r in response]
+        response_lengths = torch.tensor(response_lens, dtype=torch.long, device=idx.device)
         max_response_length = max(response_lens)
         mean_response_length = sum(response_lens) / len(response_lens) if len(response_lens) > 0 else 0
         print(f"[DEBUG] max response length: {max_response_length}")
@@ -284,6 +285,7 @@ class vLLMRollout(BaseRollout):
             {
                 'prompts': idx,
                 'responses': response,
+                'response_lengths': response_lengths,
                 'input_ids': seq,  # here input_ids become the whole sentences
                 # 'old_log_probs': log_probs, # we will recompute old log prob with actor
                 'attention_mask': attention_mask,

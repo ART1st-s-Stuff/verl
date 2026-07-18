@@ -489,7 +489,23 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            sampling_overrides = prompts.meta_info.get('sampling_params', {})
+            if not isinstance(sampling_overrides, dict):
+                raise TypeError('rollout sampling_params meta_info must be a dict')
+            allowed_sampling_overrides = {
+                'max_tokens', 'stop', 'stop_token_ids',
+                'include_stop_str_in_output', 'detokenize', 'ignore_eos',
+                'allowed_token_ids', 'temperature', 'top_p', 'top_k', 'min_p',
+            }
+            unknown_sampling_overrides = set(sampling_overrides) - allowed_sampling_overrides
+            if unknown_sampling_overrides:
+                raise ValueError(
+                    'unsupported per-call rollout sampling overrides: '
+                    f'{sorted(unknown_sampling_overrides)}'
+                )
+            output = self.rollout.generate_sequences(
+                prompts=prompts, **sampling_overrides
+            )
 
             log_gpu_memory_usage('After rollout generation', logger=logger)
 

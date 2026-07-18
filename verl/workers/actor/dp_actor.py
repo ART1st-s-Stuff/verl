@@ -356,6 +356,15 @@ class DataParallelPPOActor(BasePPOActor):
                     clip_ratio = self.config.clip_ratio
                     entropy_coeff = self.config.entropy_coeff
 
+                    # The WM objective needs a second actor forward/backward before
+                    # the optimizer step. Keep the first PPO gradients unsharded so
+                    # the second FSDP backward accumulates tensors with matching
+                    # full-parameter shapes, then performs the normal reduce-shard.
+                    policy_no_sync = None
+                    if self.use_wm_aux:
+                        policy_no_sync = self.actor_module.no_sync()
+                        policy_no_sync.__enter__()
+
                     # all return: (bsz, response_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
@@ -388,6 +397,8 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
+                    if policy_no_sync is not None:
+                        policy_no_sync.__exit__(None, None, None)
 
                     wm_metrics = None
                     if self.use_wm_aux:

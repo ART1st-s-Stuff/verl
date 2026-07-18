@@ -831,11 +831,25 @@ class CriticWorker(Worker):
             setattr(critic_model_config, 'hidden_dropout', '0')
             if critic_model_config.model_type == "qwen2_5_vl" or "Qwen2.5-VL" in local_path:
                 from verl.models.transformers.modeling_qwen_2_5_vl_patch import Qwen2_5_VLForTokenClassification
-                critic_module = Qwen2_5_VLForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                                            torch_dtype=torch_dtype,
-                                                                            config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
-                                                                            trust_remote_code=trust_remote_code)
+                critic_module, loading_info = Qwen2_5_VLForTokenClassification.from_pretrained(
+                    pretrained_model_name_or_path=local_path,
+                    torch_dtype=torch_dtype,
+                    config=critic_model_config,
+                    attn_implementation='flash_attention_2',
+                    trust_remote_code=trust_remote_code,
+                    output_loading_info=True,
+                )
+                if self.rank == 0:
+                    allowed_missing = {'score.weight', 'score.bias'}
+                    allowed_unexpected = {'lm_head.weight'}
+                    bad_missing = set(loading_info['missing_keys']) - allowed_missing
+                    bad_unexpected = set(loading_info['unexpected_keys']) - allowed_unexpected
+                    if bad_missing or bad_unexpected:
+                        raise RuntimeError(
+                            'Qwen2.5-VL critic checkpoint coverage failed: '
+                            f'missing={sorted(bad_missing)}, '
+                            f'unexpected={sorted(bad_unexpected)}'
+                        )
             else:
                 critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                                 torch_dtype=torch_dtype,

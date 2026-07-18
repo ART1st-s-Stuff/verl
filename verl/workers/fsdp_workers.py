@@ -23,7 +23,7 @@ import torch
 import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
 import verl.utils.torch_functional as verl_F
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from verl import DataProto
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import register, Dispatch
@@ -292,6 +292,39 @@ class ActorRolloutRefWorker(Worker):
 
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
 
+    def _build_nimloth_wm_auxiliary(self):
+        from torch import optim
+        from torch.nn.parallel import DistributedDataParallel
+        from verl.utils.torch_functional import get_constant_schedule_with_warmup
+        from nimloth.training.rl.verl_wm_aux import (
+            build_nimloth_wm_auxiliary_modules,
+        )
+
+        wm_config = self.config.actor.get('nimloth_wm_aux', {})
+        module = build_nimloth_wm_auxiliary_modules(
+            self.actor_model_config, wm_config
+        ).to(device=torch.cuda.current_device(), dtype=torch.float32)
+        module = DistributedDataParallel(
+            module,
+            device_ids=[torch.cuda.current_device()],
+            output_device=torch.cuda.current_device(),
+            broadcast_buffers=False,
+        )
+        lr = float(wm_config.get('lr', self.config.actor.optim.lr))
+        optimizer = optim.AdamW(
+            module.parameters(),
+            lr=lr,
+            betas=tuple(wm_config.get('betas', (0.9, 0.999))),
+            weight_decay=float(wm_config.get('weight_decay', 1e-2)),
+        )
+        total_steps = int(self.config.actor.optim.get('total_training_steps', 0))
+        warmup_ratio = float(wm_config.get('lr_warmup_steps_ratio', 0.0))
+        scheduler = get_constant_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=int(warmup_ratio * total_steps),
+        )
+        return module, optimizer, scheduler
+
     def _build_rollout(self):
         from torch.distributed.device_mesh import init_device_mesh
         # TODO(sgm): support FSDP hybrid shard for larger model
@@ -378,12 +411,25 @@ class ActorRolloutRefWorker(Worker):
                 log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
         # load from checkpoint
         if self._is_actor:
+            self.wm_auxiliary_module = None
+            self.wm_optimizer = None
+            self.wm_lr_scheduler = None
+            if bool(self.config.actor.get('nimloth_wm_aux', {}).get('enabled', False)):
+                (
+                    self.wm_auxiliary_module,
+                    self.wm_optimizer,
+                    self.wm_lr_scheduler,
+                ) = self._build_nimloth_wm_auxiliary()
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
-            self.actor = DataParallelPPOActor(config=self.config.actor,
-                                              actor_module=self.actor_module_fsdp,
-                                              actor_optimizer=self.actor_optimizer)
+            self.actor = DataParallelPPOActor(
+                config=self.config.actor,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                wm_auxiliary_module=self.wm_auxiliary_module,
+                wm_optimizer=self.wm_optimizer,
+            )
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
@@ -442,6 +488,9 @@ class ActorRolloutRefWorker(Worker):
             self.actor_lr_scheduler.step()
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics['actor/lr'] = lr
+            if self.wm_lr_scheduler is not None:
+                self.wm_lr_scheduler.step()
+                metrics['actor/wm_lr'] = self.wm_lr_scheduler.get_last_lr()[0]
 
             log_gpu_memory_usage('After update policy', logger=logger)
 
@@ -630,6 +679,20 @@ class ActorRolloutRefWorker(Worker):
                                                 global_step=global_step,
                                                 remove_previous_ckpt=remove_previous_ckpt)
 
+        if self.wm_auxiliary_module is not None:
+            wm_path = os.path.join(local_path, 'nimloth_wm_aux.pt')
+            if self.rank == 0:
+                torch.save({
+                    'module': self.wm_auxiliary_module.module.state_dict(),
+                    'optimizer': self.wm_optimizer.state_dict(),
+                    'lr_scheduler': self.wm_lr_scheduler.state_dict(),
+                    'config': OmegaConf.to_container(
+                        self.config.actor.nimloth_wm_aux, resolve=True
+                    ),
+                    'global_step': int(global_step),
+                }, wm_path)
+            torch.distributed.barrier()
+
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -640,6 +703,28 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.load_checkpoint(path=path, del_local_after_load=del_local_after_load)
+
+        if self.wm_auxiliary_module is not None:
+            wm_path = os.path.join(path, 'nimloth_wm_aux.pt')
+            if not os.path.isfile(wm_path):
+                raise FileNotFoundError(
+                    f'enabled Nimloth WM auxiliary checkpoint is missing: {wm_path}'
+                )
+            state = torch.load(wm_path, map_location='cpu', weights_only=False)
+            expected_config = OmegaConf.to_container(
+                self.config.actor.nimloth_wm_aux, resolve=True
+            )
+            if state.get('config') != expected_config:
+                raise ValueError('Nimloth WM auxiliary checkpoint config mismatch')
+            self.wm_auxiliary_module.module.load_state_dict(state['module'], strict=True)
+            self.wm_optimizer.load_state_dict(state['optimizer'])
+            device = torch.device('cuda', torch.cuda.current_device())
+            for optimizer_state in self.wm_optimizer.state.values():
+                for key, value in optimizer_state.items():
+                    if isinstance(value, torch.Tensor):
+                        optimizer_state[key] = value.to(device)
+            self.wm_lr_scheduler.load_state_dict(state['lr_scheduler'])
+            torch.distributed.barrier()
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

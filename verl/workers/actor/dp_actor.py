@@ -44,11 +44,29 @@ class DataParallelPPOActor(BasePPOActor):
         config,
         actor_module: nn.Module,
         actor_optimizer: torch.optim.Optimizer = None,
+        wm_auxiliary_module: nn.Module = None,
+        wm_optimizer: torch.optim.Optimizer = None,
     ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.wm_auxiliary_module = wm_auxiliary_module
+        self.wm_optimizer = wm_optimizer
+        self.wm_aux_config = self.config.get('nimloth_wm_aux', {})
+        self.use_wm_aux = bool(self.wm_aux_config.get('enabled', False))
+        self.wm_loss_coef = float(self.wm_aux_config.get('loss_coef', 0.0))
+        self.wm_latent_token_count = int(self.wm_aux_config.get('latent_token_count', 0))
+        if self.use_wm_aux:
+            if actor_optimizer is None or wm_auxiliary_module is None or wm_optimizer is None:
+                raise ValueError('enabled Nimloth WM auxiliary requires actor and WM optimizers/modules')
+            if self.wm_loss_coef <= 0 or self.wm_latent_token_count < 1:
+                raise ValueError('invalid Nimloth WM auxiliary coefficient or latent count')
+            if self.config.get('use_remove_padding', False):
+                raise ValueError('Nimloth WM auxiliary does not support remove-padding yet')
+            if int(self.config.ulysses_sequence_parallel_size) != 1:
+                raise ValueError('Nimloth WM auxiliary currently requires Ulysses size1')
+        self.last_wm_grad_norm = torch.tensor(0.0)
         self.use_remove_padding = self.config.get('use_remove_padding', False)
         print(f'Actor use_remove_padding={self.use_remove_padding}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
@@ -180,18 +198,28 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        
-        
-        grad_norm_threshold = self.config.grad_norm_threshold  
-        
-        # Only update if grad_norm is below threshold
-        if not torch.isfinite(grad_norm) or (grad_norm_threshold is not None and grad_norm >= grad_norm_threshold):
+        if self.use_wm_aux:
+            self.last_wm_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.wm_auxiliary_module.parameters(), max_norm=self.config.grad_clip
+            )
+        else:
+            self.last_wm_grad_norm = torch.zeros_like(grad_norm)
+
+        grad_norm_threshold = self.config.grad_norm_threshold
+        wm_invalid = not torch.isfinite(self.last_wm_grad_norm)
+
+        # Only update if both actor and auxiliary gradients are valid.
+        if not torch.isfinite(grad_norm) or wm_invalid or (grad_norm_threshold is not None and grad_norm >= grad_norm_threshold):
             # Skip the update
             print(f"[DEBUG] Skipping optimizer step due to high gradient norm: {grad_norm}")
             self.actor_optimizer.zero_grad()
+            if self.wm_optimizer is not None:
+                self.wm_optimizer.zero_grad()
         else:
             print(f"[DEBUG] Performing optimizer step with gradient norm: {grad_norm}")
             self.actor_optimizer.step()
+            if self.wm_optimizer is not None:
+                self.wm_optimizer.step()
         return grad_norm
 
     def compute_log_prob(self, data: DataProto) -> torch.Tensor:
@@ -264,6 +292,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        if self.use_wm_aux:
+            select_keys.extend([
+                'wm_latent_positions', 'wm_action_indices', 'wm_transition_mask'
+            ])
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
@@ -294,6 +326,8 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                if self.wm_optimizer is not None:
+                    self.wm_optimizer.zero_grad()
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -355,16 +389,43 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
 
+                    wm_metrics = None
+                    if self.use_wm_aux:
+                        from nimloth.training.rl.verl_wm_aux import (
+                            compute_verl_wm_auxiliary_loss,
+                        )
+                        wm_loss, wm_metrics = compute_verl_wm_auxiliary_loss(
+                            self.actor_module,
+                            self.wm_auxiliary_module,
+                            data,
+                            latent_token_count=self.wm_latent_token_count,
+                        )
+                        scaled_wm_loss = (
+                            self.wm_loss_coef * wm_loss / self.gradient_accumulation
+                        )
+                        scaled_wm_loss.backward()
+
                     data = {
                         'actor/entropy_loss': entropy_loss.detach().item(),
                         'actor/pg_loss': pg_loss.detach().item(),
                         'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                         'actor/ppo_kl': ppo_kl.detach().item(),
                     }
+                    if wm_metrics is not None:
+                        data.update({
+                            'actor/wm_mse': wm_metrics['wm_mse'],
+                            'actor/wm_transitions': wm_metrics['wm_transitions'],
+                            'actor/wm_loss_coef': self.wm_loss_coef,
+                        })
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
-                data = {'actor/grad_norm': grad_norm.detach().item()}
+                data = {
+                    'actor/grad_norm': grad_norm.detach().item(),
+                    'actor/wm_grad_norm': self.last_wm_grad_norm.detach().item(),
+                }
             append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+        if self.wm_optimizer is not None:
+            self.wm_optimizer.zero_grad()
         return metrics

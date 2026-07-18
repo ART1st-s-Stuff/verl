@@ -15,6 +15,7 @@
 The main entry point to run the PPO algorithm
 """
 
+import json
 import logging
 import os
 import warnings
@@ -44,6 +45,29 @@ from codetiming import Timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
+
+
+def _nimloth_parameter_fingerprint(module):
+    """Return a world-aggregated audit fingerprint for sharded parameters."""
+    local_sum = 0.0
+    local_sum_sq = 0.0
+    local_numel = 0
+    for parameter in module.parameters():
+        value = parameter.detach().double()
+        local_sum += float(value.sum().item())
+        local_sum_sq += float(value.square().sum().item())
+        local_numel += int(value.numel())
+    values = torch.tensor(
+        [local_sum, local_sum_sq, float(local_numel)],
+        dtype=torch.float64,
+        device=torch.cuda.current_device(),
+    )
+    torch.distributed.all_reduce(values)
+    return {
+        'sum': float(values[0].item()),
+        'sum_sq': float(values[1].item()),
+        'parameter_numel': int(values[2].item()),
+    }
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -475,6 +499,16 @@ class ActorRolloutRefWorker(Worker):
 
         log_gpu_memory_usage('Before update policy', logger=logger)
 
+        nimloth_audit = bool(self.config.actor.get('nimloth_parameter_audit', False))
+        actor_before = (
+            _nimloth_parameter_fingerprint(self.actor_module_fsdp)
+            if nimloth_audit else None
+        )
+        wm_before = (
+            _nimloth_parameter_fingerprint(self.wm_auxiliary_module)
+            if nimloth_audit and self.wm_auxiliary_module is not None else None
+        )
+
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
@@ -491,6 +525,35 @@ class ActorRolloutRefWorker(Worker):
             if self.wm_lr_scheduler is not None:
                 self.wm_lr_scheduler.step()
                 metrics['actor/wm_lr'] = self.wm_lr_scheduler.get_last_lr()[0]
+
+            if nimloth_audit:
+                actor_after = _nimloth_parameter_fingerprint(self.actor_module_fsdp)
+                wm_after = (
+                    _nimloth_parameter_fingerprint(self.wm_auxiliary_module)
+                    if self.wm_auxiliary_module is not None else None
+                )
+                if actor_after == actor_before:
+                    raise RuntimeError('Nimloth actor optimizer did not change parameters')
+                if wm_before is not None and wm_after == wm_before:
+                    raise RuntimeError('Nimloth WM optimizer did not change parameters')
+                metrics['audit/actor_parameter_sum_change'] = (
+                    actor_after['sum'] - actor_before['sum']
+                )
+                if wm_before is not None:
+                    metrics['audit/wm_parameter_sum_change'] = (
+                        wm_after['sum'] - wm_before['sum']
+                    )
+                if self.rank == 0:
+                    print(
+                        'NIMLOTH_ACTOR_WM_UPDATE_AUDIT='
+                        + json.dumps({
+                            'actor_before': actor_before,
+                            'actor_after': actor_after,
+                            'wm_before': wm_before,
+                            'wm_after': wm_after,
+                        }, sort_keys=True),
+                        flush=True,
+                    )
 
             log_gpu_memory_usage('After update policy', logger=logger)
 
@@ -650,6 +713,18 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['temperature'] = self.config.rollout.temperature
         data.meta_info['max_token_len'] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
+        if bool(self.config.ref.get('nimloth_parameter_audit', False)):
+            ref_fingerprint = _nimloth_parameter_fingerprint(self.ref_module_fsdp)
+            previous = getattr(self, '_nimloth_ref_fingerprint', None)
+            if previous is not None and ref_fingerprint != previous:
+                raise RuntimeError('Nimloth immutable reference parameters changed')
+            self._nimloth_ref_fingerprint = ref_fingerprint
+            if self.rank == 0:
+                print(
+                    'NIMLOTH_REFERENCE_AUDIT='
+                    + json.dumps(ref_fingerprint, sort_keys=True),
+                    flush=True,
+                )
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             output = self.ref_policy.compute_log_prob(data=data)
@@ -989,6 +1064,12 @@ class CriticWorker(Worker):
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=torch.cuda.current_device())
 
+        nimloth_audit = bool(self.config.get('nimloth_parameter_audit', False))
+        critic_before = (
+            _nimloth_parameter_fingerprint(self.critic_module)
+            if nimloth_audit else None
+        )
+
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
@@ -1004,6 +1085,23 @@ class CriticWorker(Worker):
             self.critic_lr_scheduler.step()
             lr = self.critic_lr_scheduler.get_last_lr()[0]
             metrics['critic/lr'] = lr
+
+            if nimloth_audit:
+                critic_after = _nimloth_parameter_fingerprint(self.critic_module)
+                if critic_after == critic_before:
+                    raise RuntimeError('Nimloth critic optimizer did not change parameters')
+                metrics['audit/critic_parameter_sum_change'] = (
+                    critic_after['sum'] - critic_before['sum']
+                )
+                if self.rank == 0:
+                    print(
+                        'NIMLOTH_CRITIC_UPDATE_AUDIT='
+                        + json.dumps({
+                            'critic_before': critic_before,
+                            'critic_after': critic_after,
+                        }, sort_keys=True),
+                        flush=True,
+                    )
 
             output = DataProto(batch=None, meta_info={'metrics': metrics})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)

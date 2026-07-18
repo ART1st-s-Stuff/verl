@@ -215,7 +215,7 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get('do_sample', True)
         max_response_per_turn = self.config.get('max_response_per_turn', None)
-        if max_response_per_turn is not None:
+        if max_response_per_turn is not None and 'max_tokens' not in kwargs:
             kwargs['max_tokens'] = max_response_per_turn
         if not do_sample:
             kwargs = {

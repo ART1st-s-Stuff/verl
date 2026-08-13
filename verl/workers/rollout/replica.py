@@ -35,6 +35,8 @@ class TokenOutput(BaseModel):
     """response token ids"""
     log_probs: Optional[list[float]] = None
     """logprobs of response token ids"""
+    policy_state: Optional[dict] = None
+    """optional identity-bound rollout state returned by a custom replica"""
 
 
 class RolloutMode(Enum):

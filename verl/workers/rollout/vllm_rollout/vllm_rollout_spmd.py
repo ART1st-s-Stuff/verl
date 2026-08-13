@@ -576,6 +576,11 @@ class vLLMAsyncRollout(BaseRollout):
             except Exception as e:
                 logger.exception(f"vLLMAsyncRollout _loop_forever error: {e}")
                 await self.socket.send(pickle.dumps(e))
+                # Nimloth capture methods are request-scoped utility RPCs. Their
+                # validation errors must not kill the worker's ZeroMQ control
+                # loop, otherwise a later request cannot clean up or fail closed.
+                if isinstance(method, str) and method.startswith("nimloth_"):
+                    continue
                 break
 
     def _init_worker(self, all_kwargs: list[dict[str, Any]]):

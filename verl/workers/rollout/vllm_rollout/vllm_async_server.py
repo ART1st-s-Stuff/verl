@@ -412,6 +412,11 @@ class vLLMHttpServerBase:
         async for output in generator:
             final_res = output
         assert final_res is not None
+        if final_res.request_id != request_id:
+            raise RuntimeError(
+                "vLLM response request identity mismatch: "
+                f"{final_res.request_id!r} != {request_id!r}"
+            )
 
         token_ids = final_res.outputs[0].token_ids
         log_probs = None

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -39,12 +40,22 @@ def test_same_forward_returns_raw_action_boundary_logits_before_temperature() ->
         "position_ids": torch.arange(4).expand(2, -1),
         "responses": torch.tensor([[3, 4], [2, 1]]),
     }
-    entropy, token_log_probs, action_logits = actor._forward_micro_batch(
-        micro_batch,
-        temperature=2.0,
-        action_token_ids=torch.tensor([1, 5]),
-        action_response_indices=torch.tensor([0, 1]),
-    )
+    def pure_log_probs(logits, labels, **_kwargs):
+        return torch.log_softmax(logits, dim=-1).gather(
+            -1,
+            labels.unsqueeze(-1),
+        ).squeeze(-1)
+
+    with patch(
+        "verl.workers.actor.dp_actor.logprobs_from_logits",
+        side_effect=pure_log_probs,
+    ):
+        entropy, token_log_probs, action_logits = actor._forward_micro_batch(
+            micro_batch,
+            temperature=2.0,
+            action_token_ids=torch.tensor([1, 5]),
+            action_response_indices=torch.tensor([0, 1]),
+        )
     assert entropy is None
     assert token_log_probs.shape == (2, 2)
     assert torch.equal(action_logits, torch.tensor([[1.0, 5.0], [1.0, 5.0]]))

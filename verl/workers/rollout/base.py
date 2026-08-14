@@ -23,7 +23,7 @@ from verl import DataProto
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
 
-__all__ = ["BaseRollout"]
+__all__ = ["BaseRollout", "get_rollout_class", "register_rollout"]
 
 
 class BaseRollout(ABC):
@@ -84,6 +84,31 @@ _ROLLOUT_REGISTRY = {
     ("sglang", "sync"): "verl.workers.rollout.sglang_rollout.sglang_rollout.SGLangRollout",
     ("sglang", "async"): "verl.workers.rollout.sglang_rollout.sglang_rollout.ServerAdapter",
 }
+
+
+def register_rollout(rollout_name: str, mode: str, fqdn: str) -> None:
+    """Register an external rollout class before worker rollout construction."""
+
+    if not isinstance(rollout_name, str) or not rollout_name:
+        raise ValueError("rollout_name must be a non-empty string")
+    if mode not in {"sync", "async"}:
+        raise ValueError("rollout mode must be sync or async")
+    if (
+        not isinstance(fqdn, str)
+        or "." not in fqdn
+        or fqdn.startswith(".")
+        or fqdn.endswith(".")
+    ):
+        raise ValueError("rollout fqdn must contain a module and class name")
+    key = (rollout_name, mode)
+    existing = _ROLLOUT_REGISTRY.get(key)
+    if existing is None:
+        _ROLLOUT_REGISTRY[key] = fqdn
+        return
+    if existing != fqdn:
+        raise ValueError(
+            f"rollout {rollout_name}/{mode} is already registered as {existing}"
+        )
 
 
 def get_rollout_class(rollout_name: str, mode: str) -> type[BaseRollout]:

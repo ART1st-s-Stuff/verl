@@ -804,8 +804,33 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
-            self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+            actor_cls = DataParallelPPOActor
+            custom_actor = self.config.actor.get("custom_cls", None)
+            if custom_actor is not None:
+                from verl.utils.import_utils import load_extern_type
+
+                if not isinstance(custom_actor, (dict, DictConfig)):
+                    raise ValueError("actor.custom_cls must be a mapping")
+                unexpected = set(custom_actor) - {"path", "name"}
+                if unexpected or set(custom_actor) != {"path", "name"}:
+                    raise ValueError(
+                        "actor.custom_cls requires exactly path and name"
+                    )
+                actor_cls = load_extern_type(
+                    custom_actor["path"],
+                    custom_actor["name"],
+                )
+                if not isinstance(actor_cls, type) or not issubclass(
+                    actor_cls,
+                    DataParallelPPOActor,
+                ):
+                    raise TypeError(
+                        "custom actor class must subclass DataParallelPPOActor"
+                    )
+            self.actor = actor_cls(
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
             )
 
         if self._is_rollout:

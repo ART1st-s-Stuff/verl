@@ -92,13 +92,26 @@ class DataParallelPPOActor(BasePPOActor):
             self.scaler = None
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        *,
+        action_token_ids=None,
+        action_response_indices=None,
+    ):
+        """Return response token statistics and optional raw action-boundary logits.
+
+        The optional action logits come from the same transformer forward and
+        are selected before rollout-temperature scaling. Both optional inputs
+        must be supplied together; the action token table is shared by the
+        micro-batch and each row has its own response-token boundary index.
         """
-        Returns:
-            entropy: # (bs, response_len)
-            log_probs: # (bs, response_len)
-        """
+        action_logits_requested = action_token_ids is not None or action_response_indices is not None
+        if action_logits_requested and (action_token_ids is None or action_response_indices is None):
+            raise ValueError("action token IDs and response indices must be supplied together")
+        if action_logits_requested and self.use_fused_kernels:
+            raise ValueError("raw action logits are unavailable with fused actor kernels")
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -112,6 +125,28 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            selected_action_logits = None
+            if action_logits_requested:
+                action_response_indices = torch.as_tensor(
+                    action_response_indices,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                if tuple(action_response_indices.shape) != (batch_size,):
+                    raise ValueError("action response indices must have shape (batch_size,)")
+                if torch.any(action_response_indices < 0) or torch.any(
+                    action_response_indices >= response_length
+                ):
+                    raise ValueError("action response index is outside the response")
+                action_token_ids = torch.as_tensor(
+                    action_token_ids,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                if action_token_ids.ndim != 1 or action_token_ids.numel() < 1:
+                    raise ValueError("action token IDs must be one non-empty table")
+                if torch.unique(action_token_ids).numel() != action_token_ids.numel():
+                    raise ValueError("action token IDs must be unique")
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -190,14 +225,23 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad.div_(temperature)
+                    action_logits_rmpad = None
+                    if action_logits_requested:
+                        action_logits_rmpad = logits_rmpad.index_select(
+                            -1,
+                            action_token_ids,
+                        )
+                        scaled_logits_rmpad = logits_rmpad / temperature
+                    else:
+                        logits_rmpad.div_(temperature)
+                        scaled_logits_rmpad = logits_rmpad
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
-                        logits=logits_rmpad,
+                        logits=scaled_logits_rmpad,
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
@@ -205,10 +249,13 @@ class DataParallelPPOActor(BasePPOActor):
                     # compute entropy
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
-                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                            entropy_rmpad = self.compute_entropy_from_logits(
+                                scaled_logits_rmpad
+                            )  # ((total_nnz / sp) + pad)
                         else:
                             entropy_rmpad = torch.utils.checkpoint.checkpoint(
-                                self.compute_entropy_from_logits, logits_rmpad
+                                self.compute_entropy_from_logits,
+                                scaled_logits_rmpad,
                             )
 
                 # gather log_prob if sp > 1
@@ -227,6 +274,13 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                    if action_logits_requested:
+                        action_logits_rmpad = gather_outputs_and_unpad(
+                            action_logits_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
@@ -241,6 +295,20 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                if action_logits_requested:
+                    full_action_logits = pad_input(
+                        hidden_states=action_logits_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    response_action_logits = full_action_logits[
+                        :, -response_length - 1 : -1, :
+                    ]
+                    selected_action_logits = response_action_logits[
+                        torch.arange(batch_size, device=input_ids.device),
+                        action_response_indices,
+                    ]
 
                 # only return response part:
                 if calculate_entropy:
@@ -267,10 +335,20 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
                 else:
-                    logits = output.logits
-
-                    logits.div_(temperature)
-                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    raw_logits = output.logits[:, -response_length - 1 : -1, :]
+                    if action_logits_requested:
+                        boundary_logits = raw_logits[
+                            torch.arange(batch_size, device=input_ids.device),
+                            action_response_indices,
+                        ]
+                        selected_action_logits = boundary_logits.index_select(
+                            -1,
+                            action_token_ids,
+                        )
+                        logits = raw_logits / temperature
+                    else:
+                        raw_logits.div_(temperature)
+                        logits = raw_logits
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
@@ -278,6 +356,8 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
+            if action_logits_requested:
+                return entropy, log_probs, selected_action_logits
             return entropy, log_probs
 
     def _optimizer_step(self):

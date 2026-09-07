@@ -233,8 +233,8 @@ class vLLMRollout(BaseRollout):
                 import importlib.metadata
                 from pathlib import Path
                 params = {key: getattr(self.sampling_params, key) for key in
-                          ("temperature", "top_p", "top_k", "n", "max_tokens")}
-                expected = dict(temperature=0.7, top_p=0.95, top_k=-1, n=1, max_tokens=256)
+                          ("temperature", "top_p", "top_k", "n", "max_tokens", "seed")}
+                expected = dict(temperature=0.7, top_p=0.95, top_k=-1, n=1, max_tokens=256, seed=None)
                 if params != expected:
                     raise RuntimeError(f"Original validation sampling drift: {params}")
                 if importlib.metadata.version("vllm") != "0.8.5.post1":

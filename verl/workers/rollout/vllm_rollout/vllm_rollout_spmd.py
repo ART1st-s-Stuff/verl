@@ -229,8 +229,9 @@ class vLLMRollout(BaseRollout):
         with self.update_sampling_params(**kwargs):
             audit_dir = os.environ.get("ORIGINAL_VALIDATION_RUNTIME_DIR")
             if audit_dir and not getattr(self, "_validation_audit_saved", False):
-                import json
                 import importlib.metadata
+                import json
+                import sys
                 from pathlib import Path
                 params = {key: getattr(self.sampling_params, key) for key in
                           ("temperature", "top_p", "top_k", "n", "max_tokens", "seed")}
@@ -240,7 +241,8 @@ class vLLMRollout(BaseRollout):
                 if importlib.metadata.version("vllm") != "0.8.5.post1":
                     raise RuntimeError("Original validation requires vllm 0.8.5.post1")
                 record = {"sampling_params": params, "do_sample": do_sample,
-                          "verl_file": __file__, "vllm": importlib.metadata.version("vllm"),
+                          "verl_file": __file__, "python_executable": sys.executable,
+                          "vllm": importlib.metadata.version("vllm"),
                           "rank": torch.distributed.get_rank()}
                 target = Path(audit_dir) / f"sampling-rank-{record['rank']}.json"
                 with target.open("x") as output:

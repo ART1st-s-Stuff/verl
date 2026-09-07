@@ -24,6 +24,7 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
+import os
 import numpy as np
 from typing import List
 from contextlib import contextmanager
@@ -102,7 +103,7 @@ class vLLMRollout(BaseRollout):
         max_model_len=config.get("max_trajectory_length",config.prompt_length + config.response_length)
         # print(f"[DEBUG] max_trajectory_length: {config.max_trajectory_length}")
         # if model is qwenvl
-        if "Qwen2.5-VL" in model_path:
+        if getattr(model_hf_config, "model_type", None) == "qwen2_5_vl":
             self.inference_engine = LLM(
                 model=model_path,
                 enable_sleep_mode=True,
@@ -226,6 +227,25 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            audit_dir = os.environ.get("ORIGINAL_VALIDATION_RUNTIME_DIR")
+            if audit_dir and not getattr(self, "_validation_audit_saved", False):
+                import json
+                import importlib.metadata
+                from pathlib import Path
+                params = {key: getattr(self.sampling_params, key) for key in
+                          ("temperature", "top_p", "top_k", "n", "max_tokens")}
+                expected = dict(temperature=0.7, top_p=0.95, top_k=-1, n=1, max_tokens=256)
+                if params != expected:
+                    raise RuntimeError(f"Original validation sampling drift: {params}")
+                if importlib.metadata.version("vllm") != "0.8.5.post1":
+                    raise RuntimeError("Original validation requires vllm 0.8.5.post1")
+                record = {"sampling_params": params, "do_sample": do_sample,
+                          "verl_file": __file__, "vllm": importlib.metadata.version("vllm"),
+                          "rank": torch.distributed.get_rank()}
+                target = Path(audit_dir) / f"sampling-rank-{record['rank']}.json"
+                with target.open("x") as output:
+                    json.dump(record, output, indent=2)
+                self._validation_audit_saved = True
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,

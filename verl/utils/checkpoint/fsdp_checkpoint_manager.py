@@ -142,7 +142,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 print(f'[rank-{self.rank}]: Saving checkpoint to {os.path.abspath(model_path)}')
                 print(f'[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}')
                 torch.save(model_state_dict, model_path)
-                torch.save(optimizer_state_dict, optim_path)  # TODO: address optimizer is None
+                save_optimizer_ckpt = os.environ.get("VERL_SAVE_OPTIMIZER_CKPT", "True").lower() not in {"0", "false", "no", "off"}
+                if save_optimizer_ckpt:
+                    torch.save(optimizer_state_dict, optim_path)  # TODO: address optimizer is None
+                else:
+                    print(f'[rank-{self.rank}]: Skipping optimizer checkpoint because VERL_SAVE_OPTIMIZER_CKPT=False')
                 torch.save(extra_state_dict, extra_path)
 
         # wait for everyone to dump to local
